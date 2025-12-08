@@ -727,6 +727,12 @@ pub trait Engine: AsAny {
     }
 }
 
+impl std::fmt::Debug for dyn Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Engine").finish()
+    }
+}
+
 // we have an 'internal' feature flag: default-engine-base, which is actually just the shared
 // pieces of default-engine-native-tls and default-engine-rustls. the crate can't compile with _only_
 // default-engine-base, so we give a friendly error here.
