@@ -48,7 +48,7 @@ pub mod storage;
 ///
 /// This is an internal utility for bridging object_store's async API to
 /// Delta Kernel's synchronous handler traits.
-pub(crate) fn stream_future_to_iter<T: Send + 'static, E: executor::TaskExecutor>(
+pub fn stream_future_to_iter<T: Send + 'static, E: executor::TaskExecutor>(
     task_executor: Arc<E>,
     stream_future: impl Future<Output = DeltaResult<BoxStream<'static, T>>> + Send + 'static,
 ) -> DeltaResult<Box<dyn Iterator<Item = T> + Send>> {
