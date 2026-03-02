@@ -29,7 +29,7 @@ use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
-use tracing::debug;
+use tracing::{debug, warn};
 
 macro_rules! prim_array_cmp {
     ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
@@ -1061,8 +1061,20 @@ pub(crate) fn parse_json(
             Error::generic("Expected json_strings to be a StringArray, found something else")
         })?;
     let schema = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
-    let result = parse_json_impl(json_strings, schema)?;
-    Ok(Box::new(ArrowEngineData::new(result)))
+    match parse_json_impl(json_strings, schema.clone()) {
+        Ok(result) => Ok(Box::new(ArrowEngineData::new(result))),
+        Err(e) => {
+            warn!("Failed to parse JSON stats: {e}. Using null stats.");
+            let null_columns: Vec<_> = schema
+                .fields()
+                .iter()
+                .map(|f| new_null_array(f.data_type(), json_strings.len()))
+                .collect();
+            let null_batch = RecordBatch::try_new(schema, null_columns)
+                .map_err(|e| Error::generic(format!("Failed to create null stats batch: {e}")))?;
+            Ok(Box::new(ArrowEngineData::new(null_batch)))
+        }
+    }
 }
 
 // Raw arrow implementation of the json parsing. Separate from the public function for testing.
@@ -1315,6 +1327,30 @@ mod tests {
         assert_eq!(batch.num_rows(), 1);
         let long_col = batch.column(0).as_string::<i32>();
         assert_eq!(long_col.value(0), long_string);
+    }
+
+    #[test]
+    fn test_parse_json_impl_propagates_type_errors() {
+        // Verify that parse_json_impl surfaces errors for values that don't match the schema,
+        // so the expression-level caller can catch them and return nulls.
+
+        // Value overflow: 99999 doesn't fit in decimal(4,2) (max 99.99)
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            ArrowDataType::Decimal128(4, 2),
+            true,
+        )]));
+        let input: Vec<Option<&str>> = vec![Some(r#"{"a": 99999}"#)];
+        assert!(parse_json_impl(&input.into(), schema).is_err());
+
+        // Type mismatch: string where integer expected
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            ArrowDataType::Int64,
+            true,
+        )]));
+        let input: Vec<Option<&str>> = vec![Some(r#"{"a": "not_a_number"}"#)];
+        assert!(parse_json_impl(&input.into(), schema).is_err());
     }
 
     #[test]
