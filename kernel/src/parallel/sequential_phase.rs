@@ -222,7 +222,7 @@ mod tests {
             (),
         )?);
 
-        let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
+        let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info, false)?;
         let mut sequential = SequentialPhase::try_new(processor, log_segment, engine.clone())?;
 
         // Process all batches and collect Add file paths
@@ -313,7 +313,7 @@ mod tests {
             (),
         )?);
 
-        let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
+        let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info, false)?;
         let mut sequential = SequentialPhase::try_new(processor, log_segment, engine.clone())?;
 
         // Call next() once but don't exhaust the iterator

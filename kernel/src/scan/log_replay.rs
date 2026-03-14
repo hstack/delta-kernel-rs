@@ -53,7 +53,7 @@ pub(crate) struct ScanLogReplayProcessor {
 
 impl ScanLogReplayProcessor {
     /// Create a new [`ScanLogReplayProcessor`] instance
-    pub(crate) fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
+    pub(crate) fn new(engine: &dyn Engine, state_info: Arc<StateInfo>, skip_stats: bool) -> DeltaResult<Self> {
         // Extract the physical predicate from StateInfo's PhysicalPredicate enum.
         // The DataSkippingFilter and partition_filter components expect the predicate
         // in the format Option<(PredicateRef, SchemaRef)>, so we need to convert from
@@ -72,12 +72,20 @@ impl ScanLogReplayProcessor {
                 None
             }
         };
+
+        // Disable data skipping when skip_stats is enabled
+        let data_skipping_filter = if skip_stats {
+            None
+        } else {
+            DataSkippingFilter::new(engine, physical_predicate.clone())
+        };
+
         Ok(Self {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
-            data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
+            data_skipping_filter,
             add_transform: engine.evaluation_handler().new_expression_evaluator(
                 get_log_add_schema().clone(),
-                get_add_transform_expr(),
+                get_add_transform_expr(skip_stats),
                 SCAN_ROW_DATATYPE.clone(),
             )?,
             seen_file_keys: Default::default(),
@@ -309,24 +317,28 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
 pub(crate) static SCAN_ROW_DATATYPE: LazyLock<DataType> =
     LazyLock::new(|| SCAN_ROW_SCHEMA.clone().into());
 
-fn get_add_transform_expr() -> ExpressionRef {
+fn get_add_transform_expr(skip_stats: bool) -> ExpressionRef {
     use crate::expressions::column_expr_ref;
-    static EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
+
+    let stats_expr = if skip_stats {
+        Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
+    } else {
+        column_expr_ref!("add.stats")
+    };
+
+    Arc::new(Expression::Struct(vec![
+        column_expr_ref!("add.path"),
+        column_expr_ref!("add.size"),
+        column_expr_ref!("add.modificationTime"),
+        stats_expr,
+        column_expr_ref!("add.deletionVector"),
         Arc::new(Expression::Struct(vec![
-            column_expr_ref!("add.path"),
-            column_expr_ref!("add.size"),
-            column_expr_ref!("add.modificationTime"),
-            column_expr_ref!("add.stats"),
-            column_expr_ref!("add.deletionVector"),
-            Arc::new(Expression::Struct(vec![
-                column_expr_ref!("add.partitionValues"),
-                column_expr_ref!("add.baseRowId"),
-                column_expr_ref!("add.defaultRowCommitVersion"),
-                column_expr_ref!("add.tags"),
-            ])),
-        ]))
-    });
-    EXPR.clone()
+            column_expr_ref!("add.partitionValues"),
+            column_expr_ref!("add.baseRowId"),
+            column_expr_ref!("add.defaultRowCommitVersion"),
+            column_expr_ref!("add.tags"),
+        ])),
+    ]))
 }
 
 // TODO: remove once `scan_metadata_from` is pub.
@@ -394,14 +406,18 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 /// that is selected in the returned `engine_data` _must_ be processed to complete the scan.
 /// Non-selected rows _must_ be ignored.
 ///
+/// When `skip_stats` is true, file statistics are not read from checkpoint parquet files and
+/// data skipping is disabled.
+///
 /// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
 /// the actions in the log from most recent to least recent.
 pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     state_info: Arc<StateInfo>,
+    skip_stats: bool,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-    Ok(ScanLogReplayProcessor::new(engine, state_info)?.process_actions_iter(action_iter))
+    Ok(ScanLogReplayProcessor::new(engine, state_info, skip_stats)?.process_actions_iter(action_iter))
 }
 
 #[cfg(test)]
@@ -490,6 +506,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             state_info,
+            false,
         )
         .unwrap();
         for res in iter {
@@ -516,6 +533,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
+            false,
         )
         .unwrap();
 
@@ -594,6 +612,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
+            false,
         )
         .unwrap();
 
@@ -626,5 +645,37 @@ mod tests {
                 panic!("Should have been a transform expression");
             }
         }
+    }
+
+    #[test]
+    fn test_scan_action_iter_with_skip_stats() {
+        let batch = vec![add_batch_simple(get_commit_schema().clone())];
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([
+            StructField::new("value", DataType::INTEGER, true),
+            StructField::new("date", DataType::DATE, true),
+        ]));
+        let state_info = get_simple_state_info(schema, vec!["date".to_string()]).unwrap();
+
+        let iter = scan_action_iter(
+            &SyncEngine::new(),
+            batch
+                .into_iter()
+                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
+            Arc::new(state_info),
+            true,
+        )
+        .unwrap();
+
+        let mut found_add = false;
+        for res in iter {
+            let scan_metadata = res.unwrap();
+            scan_metadata
+                .visit_scan_files((), |_: &mut (), scan_file: ScanFile| {
+                    assert!(scan_file.stats.is_none());
+                })
+                .unwrap();
+            found_add = true;
+        }
+        assert!(found_add);
     }
 }

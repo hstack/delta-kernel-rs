@@ -56,11 +56,34 @@ pub(crate) static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| get_commit_schema().project(&[ADD_NAME]).unwrap());
 
+// Checkpoint read schema without stats column for skip_stats optimization
+#[allow(clippy::unwrap_used)]
+static CHECKPOINT_READ_SCHEMA_NO_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
+    let add_schema = get_commit_schema().project(&[ADD_NAME]).unwrap();
+    // Project all fields except stats from the add action
+    let add_field = add_schema.field(ADD_NAME).unwrap();
+    let add_struct = match add_field.data_type() {
+        DataType::Struct(s) => s.as_ref(),
+        _ => panic!("Expected add field to be a struct"),
+    };
+    let fields_without_stats: Vec<_> = add_struct
+        .fields()
+        .filter(|f: &&StructField| f.name() != "stats")
+        .map(|f: &StructField| f.name())
+        .collect();
+    let add_schema_no_stats = add_struct.project(&fields_without_stats).unwrap();
+    Arc::new(crate::schema::StructType::new_unchecked([StructField::nullable(
+        ADD_NAME,
+        add_schema_no_stats,
+    )]))
+});
+
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
     snapshot: SnapshotRef,
     schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
+    skip_stats: bool,
 }
 
 impl std::fmt::Debug for ScanBuilder {
@@ -79,6 +102,7 @@ impl ScanBuilder {
             snapshot: snapshot.into(),
             schema: None,
             predicate: None,
+            skip_stats: false,
         }
     }
 
@@ -116,6 +140,16 @@ impl ScanBuilder {
         self
     }
 
+    /// Skip reading file statistics from checkpoint parquet files.
+    ///
+    /// When enabled, the stats column is not read from checkpoint files and data skipping
+    /// is disabled. This is useful when the caller handles data skipping externally or
+    /// doesn't need file statistics.
+    pub fn with_skip_stats(mut self, skip_stats: bool) -> Self {
+        self.skip_stats = skip_stats;
+        self
+    }
+
     /// Build the [`Scan`].
     ///
     /// This does not scan the table at this point, but does do some work to ensure that the
@@ -140,6 +174,7 @@ impl ScanBuilder {
         Ok(Scan {
             snapshot: self.snapshot,
             state_info: Arc::new(state_info),
+            skip_stats: self.skip_stats,
         })
     }
 }
@@ -328,6 +363,7 @@ impl HasSelectionVector for ScanMetadata {
 pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
+    skip_stats: bool,
 }
 
 impl std::fmt::Debug for Scan {
@@ -558,7 +594,7 @@ impl Scan {
         if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
             return Ok(None.into_iter().flatten());
         }
-        let it = scan_action_iter(engine, action_batch_iter, self.state_info.clone())?;
+        let it = scan_action_iter(engine, action_batch_iter, self.state_info.clone(), self.skip_stats)?;
         Ok(Some(it).into_iter().flatten())
     }
 
@@ -569,12 +605,17 @@ impl Scan {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
+        let checkpoint_schema = if self.skip_stats {
+            CHECKPOINT_READ_SCHEMA_NO_STATS.clone()
+        } else {
+            CHECKPOINT_READ_SCHEMA.clone()
+        };
         self.snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
-                CHECKPOINT_READ_SCHEMA.clone(),
+                checkpoint_schema,
                 None,
             )
     }
