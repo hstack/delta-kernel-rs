@@ -8,7 +8,7 @@ use super::{PhysicalPredicate, ScanMetadata};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, PredicateRef};
+use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, PredicateRef, UnaryExpressionOp};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::scan::Scalar;
@@ -44,6 +44,7 @@ pub(crate) struct ScanLogReplayProcessor {
     partition_filter: Option<PredicateRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
     add_transform: Arc<dyn ExpressionEvaluator>,
+    add_checkpoint_transform: Arc<dyn ExpressionEvaluator>,
     state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
@@ -84,6 +85,11 @@ impl ScanLogReplayProcessor {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
             data_skipping_filter,
             add_transform: engine.evaluation_handler().new_expression_evaluator(
+                get_log_add_schema().clone(),
+                get_add_transform_expr(false),
+                SCAN_ROW_DATATYPE.clone(),
+            )?,
+            add_checkpoint_transform: engine.evaluation_handler().new_expression_evaluator(
                 get_log_add_schema().clone(),
                 get_add_transform_expr(skip_stats),
                 SCAN_ROW_DATATYPE.clone(),
@@ -317,11 +323,21 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
 pub(crate) static SCAN_ROW_DATATYPE: LazyLock<DataType> =
     LazyLock::new(|| SCAN_ROW_SCHEMA.clone().into());
 
+static STATS_JSON_EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
+    Arc::new(
+        Expression::unary(
+            UnaryExpressionOp::ToJson,
+            Expression::column(["add", "stats_parsed"]),
+        )
+    )
+});
+
 fn get_add_transform_expr(skip_stats: bool) -> ExpressionRef {
     use crate::expressions::column_expr_ref;
 
     let stats_expr = if skip_stats {
-        Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
+        // Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
+        STATS_JSON_EXPR.clone()
     } else {
         column_expr_ref!("add.stats")
     };
@@ -387,7 +403,11 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         visitor.visit_rows_of(actions.as_ref())?;
 
         // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
-        let result = self.add_transform.evaluate(actions.as_ref())?;
+        let result = if is_log_batch {
+            self.add_transform.evaluate(actions.as_ref())?
+        } else {
+            self.add_checkpoint_transform.evaluate(actions.as_ref())?
+        };
         ScanMetadata::try_new(
             result,
             visitor.selection_vector,

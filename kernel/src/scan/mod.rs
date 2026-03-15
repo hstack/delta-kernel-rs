@@ -23,10 +23,7 @@ use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::LogSegment;
 use crate::scan::log_replay::BASE_ROW_ID_NAME;
 use crate::scan::state_info::StateInfo;
-use crate::schema::{
-    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
-    ToSchema as _,
-};
+use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField, StructType, ToSchema as _};
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
@@ -65,16 +62,25 @@ static CHECKPOINT_READ_SCHEMA_NO_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
     let add_struct = match add_field.data_type() {
         DataType::Struct(s) => s.as_ref(),
         _ => panic!("Expected add field to be a struct"),
-    };
-    let fields_without_stats: Vec<_> = add_struct
-        .fields()
-        .filter(|f: &&StructField| f.name() != "stats")
-        .map(|f: &StructField| f.name())
-        .collect();
-    let add_schema_no_stats = add_struct.project(&fields_without_stats).unwrap();
-    Arc::new(crate::schema::StructType::new_unchecked([StructField::nullable(
+    }.clone();
+
+    // remove stats field
+    let add_struct = add_struct.with_field_removed("stats");
+
+    // add stats_parsed field after stats
+    let stats_parsed_field = StructField::new(
+        "stats_parsed",
+        StructType::try_new([StructField::new("numRecords", DataType::LONG, true)]).unwrap(),
+        true,
+    );
+    let add_struct = add_struct.with_field_inserted_after(
+        None,
+        stats_parsed_field,
+    ).unwrap();
+
+    Arc::new(StructType::new_unchecked([StructField::nullable(
         ADD_NAME,
-        add_schema_no_stats,
+        add_struct,
     )]))
 });
 
