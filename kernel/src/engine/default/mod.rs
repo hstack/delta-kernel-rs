@@ -95,7 +95,7 @@ pub struct DefaultEngine<E: TaskExecutor> {
     metrics_reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
-impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
+impl DefaultEngine<executor::tokio::TokioMultiThreadExecutor> {
     /// Create a new [`DefaultEngine`] instance with the default executor.
     ///
     /// Uses `TokioBackgroundExecutor` as the default executor.
@@ -107,7 +107,7 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
     pub fn new(object_store: Arc<DynObjectStore>) -> Self {
         Self::new_with_executor(
             object_store,
-            Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
+            Arc::new(executor::tokio::TokioMultiThreadExecutor::new(tokio::runtime::Handle::current())),
         )
     }
 
