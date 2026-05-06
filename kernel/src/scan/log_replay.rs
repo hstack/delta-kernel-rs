@@ -667,7 +667,15 @@ fn get_add_transform_expr(
     partition_schema: Option<SchemaRef>,
     has_partition_values_parsed: bool,
 ) -> ExpressionRef {
-    let stats_expr = if skip_stats {
+    // @HStack skip_stats - the other part of this is in build_projected_checkpoint_read_info
+    // if we HAVE compatible stats_parsed, we DON'T load "stats" at all,
+    // therefore, we empty stats_expr
+    let skip_stats_loading_if_has_stats_parsed = std::env::var("DELTA_SKIP_STATS_LOADING_IF_HAS_STATS_PARSED")
+        .unwrap_or_else(|_| "true".to_string())
+        .parse()
+        .unwrap_or(true);
+
+    let stats_expr = if skip_stats || (skip_stats_loading_if_has_stats_parsed && has_stats_parsed) {
         Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
     } else {
         column_expr_ref!("add.stats")

@@ -1080,7 +1080,7 @@ impl LogSegment {
             .is_some_and(|(ps, fs)| Self::schema_has_compatible_partition_values_parsed(fs, ps));
 
         let needs_add_augmentation = has_stats_parsed || has_partition_values_parsed;
-        let checkpoint_read_schema = if needs_add_augmentation || include_sidecar_field {
+        let mut checkpoint_read_schema = if needs_add_augmentation || include_sidecar_field {
             let mut new_fields: Vec<StructField> = if let (true, Some(add_field)) =
                 (needs_add_augmentation, action_schema.field("add"))
             {
@@ -1132,6 +1132,33 @@ impl LogSegment {
         } else {
             action_schema
         };
+
+        // @HStack skip stats loading
+        // our tables have stats_parsed. If the env var DELTA_SKIP_STATS_LOADING_IF_HAS_STATS_PARSED is set
+        // do NOT load the stats column
+        let skip_stats_loading_if_has_stats_parsed = std::env::var("DELTA_SKIP_STATS_LOADING_IF_HAS_STATS_PARSED")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse()
+            .unwrap_or(true);
+        if has_stats_parsed && skip_stats_loading_if_has_stats_parsed {
+            if let Some(checkpoint_read_schema_no_stats) = checkpoint_read_schema
+                .field("add")
+                .and_then(|f| match f.data_type() {
+                    DataType::Struct(add_inner) => {
+                        let fields_no_stats: Vec<_> = add_inner
+                            .fields()
+                            .filter(|f| f.name() != "stats")
+                            .cloned()
+                            .collect();
+                        let add_inner_no_stats = StructType::new_unchecked(fields_no_stats);
+                        let new_add_field = StructField::new("add", add_inner_no_stats, f.nullable);
+                        Some(StructType::new_unchecked(vec![new_add_field]))
+                    },
+                    _ => None,
+                }) {
+                checkpoint_read_schema = Arc::new(checkpoint_read_schema_no_stats);
+            }
+        }
 
         Ok(CheckpointReadInfo {
             has_stats_parsed,
