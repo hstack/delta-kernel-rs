@@ -118,7 +118,7 @@ pub(crate) struct LogSegment {
     /// log segment. The hint may describe a different checkpoint version than the one in this
     /// segment. Callers should use explicit getters (such as [`Self::checkpoint_schema`]) rather
     /// than reading this field directly.
-    last_checkpoint_metadata: Option<LastCheckpointHintSummary>,
+    pub last_checkpoint_metadata: Option<LastCheckpointHintSummary>,
 }
 
 /// Returns the identifying leaf column path for a known action type, used to build IS NOT NULL
