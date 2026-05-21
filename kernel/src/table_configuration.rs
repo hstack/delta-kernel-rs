@@ -76,9 +76,9 @@ fn strip_metadata(schema: SchemaRef) -> SchemaRef {
 /// - `full`: physical representations of all columns from [`TableConfiguration::logical_schema`].
 /// - `without_partition`: lazily computed variant that excludes partition columns.
 #[derive(Debug, Clone, Eq)]
-struct PhysicalSchemas {
-    full: SchemaRef,
-    without_partition: OnceLock<SchemaRef>,
+pub struct PhysicalSchemas {
+    pub full: SchemaRef,
+    pub without_partition: OnceLock<SchemaRef>,
 }
 
 impl PhysicalSchemas {
@@ -113,15 +113,15 @@ impl PartialEq for PhysicalSchemas {
 #[internal_api]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableConfiguration {
-    metadata: Metadata,
-    protocol: Protocol,
+    pub metadata: Metadata,
+    pub protocol: Protocol,
     /// Logical schema: field names are the user-facing (logical) column names.
-    logical_schema: SchemaRef,
-    physical_schemas: PhysicalSchemas,
-    table_properties: TableProperties,
-    column_mapping_mode: ColumnMappingMode,
-    table_root: Url,
-    version: Version,
+    pub logical_schema: SchemaRef,
+    pub physical_schemas: PhysicalSchemas,
+    pub table_properties: TableProperties,
+    pub column_mapping_mode: ColumnMappingMode,
+    pub table_root: Url,
+    pub version: Version,
 }
 
 impl TableConfiguration {

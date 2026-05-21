@@ -63,10 +63,10 @@ pub enum CheckpointWriteResult {
 /// have a defined schema (which may change over time for any given table), specific version, and
 /// frozen log segment.
 pub struct Snapshot {
-    span: tracing::Span,
-    log_segment: LogSegment,
-    table_configuration: TableConfiguration,
-    lazy_crc: Arc<LazyCrc>,
+    pub span: tracing::Span,
+    pub log_segment: LogSegment,
+    pub table_configuration: TableConfiguration,
+    pub lazy_crc: Arc<LazyCrc>,
 }
 
 impl PartialEq for Snapshot {
