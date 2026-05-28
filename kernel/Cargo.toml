@@ -122,6 +122,9 @@ schema-diff = []
 # corresponding RFC (https://github.com/delta-io/delta/issues/6081).
 nanosecond-timestamps = ["test_utils/nanosecond-timestamps"]
 
+# Declarative plan execution via PlanExecutor trait (experimental)
+declarative-plans = []
+
 # this is an 'internal' feature flag which has all the shared bits from default-engine-native-tls
 # and default-engine-rustls
 default-engine-base = [

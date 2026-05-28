@@ -6,7 +6,7 @@ use tracing::{info_span, Span};
 
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
 use crate::log_segment::LogSegment;
-use crate::metrics::reporter::emit_scan_metadata_completed;
+use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::parallel_phase::ParallelPhase;
 use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
