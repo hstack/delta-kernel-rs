@@ -4153,7 +4153,7 @@ async fn test_get_unpublished_catalog_commits() {
 }
 
 // ============================================================================
-// Tests: segment_after_crc / segment_through_crc
+// Tests: segment_after_crc
 // ============================================================================
 
 fn extract_commit_versions(seg: &LogSegment) -> Vec<u64> {
@@ -4182,8 +4182,6 @@ struct CrcPruningCase {
     crc_version: u64,
     after_commits: &'static [u64],
     after_compactions: &'static [(u64, u64)],
-    through_commits: &'static [u64],
-    through_compactions: &'static [(u64, u64)],
 }
 
 #[rstest::rstest]
@@ -4191,7 +4189,6 @@ struct CrcPruningCase {
 // commits:             x  x  x  x  x  x  x  x  x  x
 // crc:                             |
 // after commits:                      x  x  x  x  x
-// through commits:     x  x  x  x  x
 #[case::only_deltas_no_checkpoint(CrcPruningCase {
     commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
     compactions: &[],
@@ -4199,15 +4196,12 @@ struct CrcPruningCase {
     crc_version: 4,
     after_commits: &[5, 6, 7, 8, 9],
     after_compactions: &[],
-    through_commits: &[0, 1, 2, 3, 4],
-    through_compactions: &[],
 })]
 //                      0  1  2  3  4  5  6  7  8  9
 // checkpoint:                |
 // commits:                      x  x  x  x  x  x  x
 // crc:                             |
 // after commits:                      x  x  x  x  x
-// through commits:              x  x
 #[case::only_deltas_with_checkpoint(CrcPruningCase {
     commits: &[3, 4, 5, 6, 7, 8, 9],
     compactions: &[],
@@ -4215,8 +4209,6 @@ struct CrcPruningCase {
     crc_version: 4,
     after_commits: &[5, 6, 7, 8, 9],
     after_compactions: &[],
-    through_commits: &[3, 4],
-    through_compactions: &[],
 })]
 //                      0  1  2  3  4  5  6  7  8  9
 // commits:             x  x  x  x  x  x  x  x  x  x
@@ -4224,24 +4216,19 @@ struct CrcPruningCase {
 // crc:                             |
 // after commits:                      x  x  x  x  x
 // after compactions:                  [-----]
-// through commits:     x  x  x  x  x
 #[case::compaction_after_crc(CrcPruningCase {
     commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
     compactions: &[(5, 7)],
     checkpoint: None,
     crc_version: 4,
     after_commits: &[5, 6, 7, 8, 9],
-    after_compactions: &[(5, 7)],
-    through_commits: &[0, 1, 2, 3, 4],
-    through_compactions: &[],
+    after_compactions: &[(5, 7)], // TODO(#2337): restore to &[(5, 7)] when re-enabled
 })]
 //                      0  1  2  3  4  5  6  7  8  9
 // commits:             x  x  x  x  x  x  x  x  x  x
 // compactions:               [-----------]
 // crc:                             |
 // after commits:                      x  x  x  x  x
-// through commits:     x  x  x  x  x
-// through compactions:
 #[case::compaction_overlaps_crc(CrcPruningCase {
     commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
     compactions: &[(2, 6)],
@@ -4249,16 +4236,12 @@ struct CrcPruningCase {
     crc_version: 4,
     after_commits: &[5, 6, 7, 8, 9],
     after_compactions: &[],
-    through_commits: &[0, 1, 2, 3, 4],
-    through_compactions: &[],
 })]
 //                      0  1  2  3  4  5  6  7  8  9
 // commits:             x  x  x  x  x  x  x  x  x  x
 // compactions:         [-----]
 // crc:                             |
 // after commits:                      x  x  x  x  x
-// through commits:     x  x  x  x  x
-// through compactions: [-----]
 #[case::compaction_before_crc(CrcPruningCase {
     commits: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
     compactions: &[(0, 2)],
@@ -4266,8 +4249,6 @@ struct CrcPruningCase {
     crc_version: 4,
     after_commits: &[5, 6, 7, 8, 9],
     after_compactions: &[],
-    through_commits: &[0, 1, 2, 3, 4],
-    through_compactions: &[(0, 2)],
 })]
 #[tokio::test]
 async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
@@ -4284,14 +4265,6 @@ async fn test_segment_crc_filtering(#[case] case: CrcPruningCase) {
     assert_eq!(extract_compaction_ranges(&after), case.after_compactions);
     assert!(after.checkpoint_version.is_none());
     assert!(after.listed.checkpoint_parts.is_empty());
-
-    let through = seg.segment_through_crc(case.crc_version);
-    assert_eq!(extract_commit_versions(&through), case.through_commits);
-    assert_eq!(
-        extract_compaction_ranges(&through),
-        case.through_compactions
-    );
-    assert_eq!(through.checkpoint_version, case.checkpoint);
 }
 
 #[rstest::rstest]
