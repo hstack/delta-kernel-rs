@@ -454,6 +454,42 @@ pub(crate) fn restored_add_schema() -> &'static SchemaRef {
     &RESTORED_ADD_SCHEMA
 }
 
+/// Variant of [`restored_add_schema`] that augments the `add` struct with an
+/// optional `stats_parsed` field. Mirrors `scan_row_schema_with_parsed_columns`
+/// (in `scan::log_replay`) on the post-`scan_metadata_from`-transform shape.
+///
+/// Returns the existing [`restored_add_schema`] when `stats_schema` is `None`
+/// so callers that don't opt in see byte-identical behavior.
+///
+/// Used by the HSTACK skip-stats-loading path: when delta-rs plumbs
+/// `stats_parsed` from an eager snapshot through `scan_metadata_from`, the
+/// post-transform `add` struct needs a matching slot.
+pub(crate) fn restored_add_schema_with_parsed_columns(
+    stats_schema: Option<&SchemaRef>,
+) -> SchemaRef {
+    let Some(stats_schema) = stats_schema else {
+        return RESTORED_ADD_SCHEMA.clone();
+    };
+    let base = &*RESTORED_ADD_SCHEMA;
+    let add_field = base
+        .field("add")
+        .expect("RESTORED_ADD_SCHEMA must have an `add` field");
+    let crate::schema::DataType::Struct(add_inner) = add_field.data_type() else {
+        unreachable!("RESTORED_ADD_SCHEMA `add` field must be a struct");
+    };
+    let mut inner_fields: Vec<StructField> = add_inner.fields().cloned().collect();
+    inner_fields.push(StructField::nullable(
+        crate::scan::log_replay::STATS_PARSED_NAME,
+        stats_schema.as_ref().clone(),
+    ));
+    StructType::new_unchecked(vec![StructField::new(
+        "add",
+        StructType::new_unchecked(inner_fields),
+        add_field.nullable,
+    )])
+    .into()
+}
+
 /// utility method making it easy to get a transform for a particular row. If the requested row is
 /// outside the range of the passed slice returns `None`, otherwise returns the element at the index
 /// of the specified row

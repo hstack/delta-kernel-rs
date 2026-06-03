@@ -670,10 +670,11 @@ fn get_add_transform_expr(
     // @HStack skip_stats - the other part of this is in build_projected_checkpoint_read_info
     // if we HAVE compatible stats_parsed, we DON'T load "stats" at all,
     // therefore, we empty stats_expr
-    let skip_stats_loading_if_has_stats_parsed = std::env::var("DELTA_SKIP_STATS_LOADING_IF_HAS_STATS_PARSED")
-        .unwrap_or_else(|_| "true".to_string())
-        .parse()
-        .unwrap_or(true);
+    let skip_stats_loading_if_has_stats_parsed =
+        std::env::var("DELTA_SKIP_STATS_LOADING_IF_HAS_STATS_PARSED")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse()
+            .unwrap_or(true);
 
     let stats_expr = if skip_stats || (skip_stats_loading_if_has_stats_parsed && has_stats_parsed) {
         Arc::new(Expression::Literal(Scalar::Null(DataType::STRING)))
@@ -724,8 +725,16 @@ fn get_add_transform_expr(
 
 // TODO: Move this to transaction/mod.rs once `scan_metadata_from` is pub, as this is used for
 // deletion vector update transformations.
+///
+/// When `has_stats_parsed` is `true`, the projection additionally carries
+/// `stats_parsed` into the `add` struct. This is the HSTACK skip-stats-loading
+/// path: when delta-rs's `scan_metadata_from` plumbs `stats_parsed` through
+/// (because the eager snapshot already has parsed stats and raw `stats` was
+/// skipped), preserving the parsed column lets downstream log replay read
+/// `numRecords` from `add.stats_parsed` instead of a null `add.stats` JSON.
+/// Upstream callers pass `false` and see no change.
 #[allow(unused)]
-pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
+pub(crate) fn get_scan_metadata_transform_expr(has_stats_parsed: bool) -> ExpressionRef {
     static EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
         Arc::new(Expression::struct_from([Arc::new(
             Expression::struct_from([
@@ -742,7 +751,31 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
             ]),
         )]))
     });
-    EXPR.clone()
+    if has_stats_parsed {
+        // @HStack: widened variant that also projects `stats_parsed`. Kept as a
+        // separate LazyLock so the upstream path returns the exact same Arc.
+        static EXPR_WITH_STATS_PARSED: LazyLock<ExpressionRef> = LazyLock::new(|| {
+            Arc::new(Expression::struct_from([Arc::new(
+                Expression::struct_from([
+                    column_expr_ref!("path"),
+                    column_expr_ref!("fileConstantValues.partitionValues"),
+                    column_expr_ref!("size"),
+                    column_expr_ref!("modificationTime"),
+                    column_expr_ref!("stats"),
+                    column_expr_ref!("fileConstantValues.tags"),
+                    column_expr_ref!("deletionVector"),
+                    column_expr_ref!("fileConstantValues.baseRowId"),
+                    column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
+                    column_expr_ref!("fileConstantValues.clusteringProvider"),
+                    // NB: keep this string in sync with STATS_PARSED_NAME above.
+                    column_expr_ref!("stats_parsed"),
+                ]),
+            )]))
+        });
+        EXPR_WITH_STATS_PARSED.clone()
+    } else {
+        EXPR.clone()
+    }
 }
 
 impl ParallelLogReplayProcessor for ScanLogReplayProcessor {

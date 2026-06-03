@@ -494,7 +494,7 @@ impl<S> Transaction<S> {
         )?;
         let restored_add_eval = evaluation_handler.new_expression_evaluator(
             nullable_scan_rows_schema().clone(),
-            get_scan_metadata_transform_expr(),
+            get_scan_metadata_transform_expr(false),
             nullable_restored_add_schema().clone().into(),
         )?;
         let with_data_change_transform =
