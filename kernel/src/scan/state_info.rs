@@ -391,6 +391,21 @@ impl StateInfo {
             512
         }
     }
+
+    /// @HStack: clone the state with an override for `physical_stats_schema`. Used by
+    /// `scan_metadata_from` when the HSTACK skip-stats-loading optimization is in
+    /// effect, to force the downstream `ScanLogReplayProcessor::checkpoint_transform`
+    /// to project `stats_parsed` into the scan-row output even when the original
+    /// scan was built without a data-skipping predicate.
+    pub(crate) fn with_physical_stats_schema(
+        &self,
+        physical_stats_schema: Option<SchemaRef>,
+    ) -> Self {
+        Self {
+            physical_stats_schema,
+            ..self.clone()
+        }
+    }
 }
 
 #[cfg(test)]

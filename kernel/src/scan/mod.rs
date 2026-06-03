@@ -11,7 +11,9 @@ use tracing::{debug, info};
 use url::Url;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
-use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
+use self::log_replay::{
+    get_scan_metadata_transform_expr, scan_action_iter, scan_row_schema_with_parsed_columns,
+};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
@@ -454,6 +456,21 @@ pub(crate) fn restored_add_schema() -> &'static SchemaRef {
     &RESTORED_ADD_SCHEMA
 }
 
+/// Return a clone of `stats_schema` with the top-level `tightBounds` field removed.
+///
+/// `build_expected_stats_schemas` always emits `tightBounds`; delta-rs's
+/// `engine_ext.rs::stats_schema` does not. When kernel needs a `parsed_stats_schema`
+/// that matches the data delta-rs materializes into `stats_parsed`, we use the kernel
+/// schema with this field stripped.
+fn strip_tight_bounds(stats_schema: &StructType) -> SchemaRef {
+    let filtered: Vec<StructField> = stats_schema
+        .fields()
+        .filter(|f| f.name() != "tightBounds")
+        .cloned()
+        .collect();
+    StructType::new_unchecked(filtered).into()
+}
+
 /// Variant of [`restored_add_schema`] that augments the `add` struct with an
 /// optional `stats_parsed` field. Mirrors `scan_row_schema_with_parsed_columns`
 /// (in `scan::log_replay`) on the post-`scan_metadata_from`-transform shape.
@@ -521,6 +538,14 @@ pub struct ScanMetadata {
     /// Note: This vector can be indexed by row number, as rows masked by the selection vector will
     /// have corresponding entries that will be `None`.
     pub scan_file_transforms: Vec<Option<ExpressionRef>>,
+
+    /// @HStack: signals that `scan_files` carries an extra `stats_parsed.numRecords`
+    /// leaf at the end of its schema (plumbed by `scan_metadata_from` when the HSTACK
+    /// skip-stats-loading optimization is in effect). The `ScanFileVisitor` reads it
+    /// as a fallback when raw `stats` is null. Default `false` keeps existing callers
+    /// byte-identical.
+    #[doc(hidden)]
+    pub has_stats_parsed_num_records: bool,
 }
 
 impl ScanMetadata {
@@ -532,7 +557,16 @@ impl ScanMetadata {
         Ok(Self {
             scan_files: FilteredEngineData::try_new(data, selection_vector)?,
             scan_file_transforms,
+            has_stats_parsed_num_records: false,
         })
+    }
+
+    /// @HStack: mark this metadata batch as carrying `stats_parsed.numRecords`.
+    /// Used by `scan_metadata_from`'s widened (HSTACK) path so the downstream
+    /// `ScanFileVisitor` knows to read the extra column.
+    pub(crate) fn with_has_stats_parsed_num_records(mut self, has: bool) -> Self {
+        self.has_stats_parsed_num_records = has;
+        self
     }
 }
 
@@ -708,7 +742,7 @@ impl Scan {
         // we treat it as if it originated from a checkpoint.
         let transform = engine.evaluation_handler().new_expression_evaluator(
             scan_row_schema(),
-            get_scan_metadata_transform_expr(),
+            get_scan_metadata_transform_expr(false),
             restored_add_schema().clone().into(),
         )?;
         let apply_transform = move |data: Box<dyn EngineData>| {
@@ -719,20 +753,115 @@ impl Scan {
 
         // If the snapshot version corresponds to the hint version, we process the existing data
         // to apply file skipping and provide the required transformations.
-        // Since we're only processing existing data (no checkpoint), we use the base schema
-        // and no stats_parsed optimization.
         if existing_version == self.snapshot.version() {
+            // @HStack: when the skip-stats-loading optimization is in effect (see commit
+            // `[HSTACK] fix: don't load "stats" column if we have "stats_parsed"` and
+            // `get_add_transform_expr` in `log_replay.rs`), `existing_data` from a delta-rs
+            // EagerSnapshot carries `stats_parsed` and a *null* raw `stats` column. The
+            // default evaluator above projects only `scan_row_schema()` fields, which drops
+            // `stats_parsed` and leaves downstream log replay without a usable `numRecords`.
+            //
+            // When the env var is set (default `true`, matching the companion HSTACK commit)
+            // and a physical stats schema is available, build a widened evaluator via the
+            // `*_with_parsed_columns` helpers so the post-transform `add` struct carries
+            // `add.stats_parsed`. Flip `has_stats_parsed: true` so the downstream
+            // `get_add_transform_expr` routes that column instead of looking at the (null)
+            // raw stats. Scoped to the equal-version branch only -- the incremental branch
+            // below chains in newly-read log batches that do NOT carry `stats_parsed`.
+            // Default `false` here (not `true` as in the companion `e6f31820` commit's
+            // `get_add_transform_expr`) because activating this path requires the caller
+            // to ALSO plumb `stats_parsed` into `existing_data` -- which only delta-rs's
+            // HSTACK fork currently does. Upstream callers of `scan_metadata_from` would
+            // otherwise hit a schema mismatch ("No such field: stats_parsed"). HSTACK
+            // consumers set the env var explicitly (cobweb's `.env`).
+            let skip_stats_loading_if_has_stats_parsed =
+                std::env::var("DELTA_SKIP_STATS_LOADING_IF_HAS_STATS_PARSED")
+                    .unwrap_or_else(|_| "false".to_string())
+                    .parse::<bool>()
+                    .unwrap_or(false);
+            // Build the stats schema that the widened evaluator will declare for the
+            // `stats_parsed` slot. It must match the schema delta-rs's EagerSnapshot
+            // actually puts into `stats_parsed` in `existing_data` (the Arrow evaluator
+            // rejects schema mismatches at runtime).
+            //
+            // Use kernel's `build_expected_stats_schemas` and then strip `tightBounds`:
+            // delta-rs's `engine_ext.rs::stats_schema` produces the same set of fields
+            // minus `tightBounds`. Aligning the two without `tightBounds` keeps the
+            // schema portable across both projection callers.
+            let parsed_stats_schema = if skip_stats_loading_if_has_stats_parsed {
+                let physical = self
+                    .snapshot
+                    .table_configuration()
+                    .build_expected_stats_schemas(None, None)
+                    .ok()
+                    .map(|s| s.physical);
+                physical.map(|physical| strip_tight_bounds(physical.as_ref()))
+            } else {
+                None
+            };
+            let use_parsed = parsed_stats_schema.is_some();
+
+            let (apply_transform, checkpoint_read_schema, has_stats_parsed): (
+                Box<dyn FnMut(Box<dyn EngineData>) -> DeltaResult<ActionsBatch>>,
+                SchemaRef,
+                bool,
+            ) = if use_parsed {
+                let widened_input =
+                    scan_row_schema_with_parsed_columns(parsed_stats_schema.clone(), None);
+                let widened_transform_expr = get_scan_metadata_transform_expr(true);
+                let widened_output =
+                    restored_add_schema_with_parsed_columns(parsed_stats_schema.as_ref());
+                let widened_evaluator = engine.evaluation_handler().new_expression_evaluator(
+                    widened_input,
+                    widened_transform_expr,
+                    widened_output.as_ref().clone().into(),
+                )?;
+                let widened_apply = move |data: Box<dyn EngineData>| {
+                    Ok(ActionsBatch::new(
+                        widened_evaluator.evaluate(data.as_ref())?,
+                        false,
+                    ))
+                };
+                (Box::new(widened_apply), widened_output, true)
+            } else {
+                (
+                    Box::new(apply_transform),
+                    restored_add_schema().clone(),
+                    false,
+                )
+            };
+
             let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
                 actions: existing_data.into_iter().map(apply_transform),
                 checkpoint_info: CheckpointReadInfo {
-                    has_stats_parsed: false,
+                    has_stats_parsed,
                     has_partition_values_parsed: false,
-                    checkpoint_read_schema: restored_add_schema().clone(),
+                    checkpoint_read_schema,
                 },
             };
-            return Ok(Box::new(
-                self.scan_metadata_inner(engine, actions_with_checkpoint_info)?,
-            ));
+            // @HStack: when use_parsed, override state_info.physical_stats_schema so
+            // the downstream ScanLogReplayProcessor's checkpoint_transform projects
+            // `stats_parsed` into the scan-row output. Otherwise the parsed column
+            // would be dropped between apply_transform and the visitor.
+            let state_info = if use_parsed {
+                Arc::new(
+                    self.state_info
+                        .with_physical_stats_schema(parsed_stats_schema.clone()),
+                )
+            } else {
+                self.state_info.clone()
+            };
+            let inner_iter = self.scan_metadata_inner_with_state(
+                engine,
+                state_info,
+                actions_with_checkpoint_info,
+            )?;
+            // @HStack: tag every emitted ScanMetadata so the downstream
+            // ScanFileVisitor reads `stats_parsed.numRecords` as a fallback when
+            // raw `stats` is null. See `ScanFileVisitor::visit_filtered`.
+            return Ok(Box::new(inner_iter.map(move |res| {
+                res.map(|m| m.with_has_stats_parsed_num_records(has_stats_parsed))
+            })));
         }
 
         // If the current log segment contains a checkpoint newer than the hint version
@@ -800,10 +929,29 @@ impl Scan {
             impl Iterator<Item = DeltaResult<ActionsBatch>>,
         >,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
+        self.scan_metadata_inner_with_state(
+            engine,
+            self.state_info.clone(),
+            actions_with_checkpoint_info,
+        )
+    }
+
+    /// @HStack: variant of `scan_metadata_inner` that allows the caller to override
+    /// `state_info`. Used by `scan_metadata_from` to force `physical_stats_schema`
+    /// non-None so the downstream `ScanLogReplayProcessor::checkpoint_transform`
+    /// projects `stats_parsed` into the scan-row output.
+    fn scan_metadata_inner_with_state(
+        &self,
+        engine: &dyn Engine,
+        state_info: Arc<StateInfo>,
+        actions_with_checkpoint_info: ActionsWithCheckpointInfo<
+            impl Iterator<Item = DeltaResult<ActionsBatch>>,
+        >,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         let start = Instant::now();
         let operation_id = MetricId::new();
 
-        let (iter, metrics) = match self.state_info.physical_predicate {
+        let (iter, metrics) = match state_info.physical_predicate {
             PhysicalPredicate::StaticSkipAll => {
                 info!("Predicate statically evaluated to false; skipping all files");
                 (None, Arc::new(ScanMetrics::default()))
@@ -812,7 +960,7 @@ impl Scan {
                 let (it, m) = scan_action_iter(
                     engine,
                     actions_with_checkpoint_info.actions,
-                    self.state_info.clone(),
+                    state_info,
                     actions_with_checkpoint_info.checkpoint_info,
                     self.skip_stats(),
                 )?;

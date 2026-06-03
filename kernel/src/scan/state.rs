@@ -161,6 +161,7 @@ impl ScanMetadata {
             callback,
             transforms: &self.scan_file_transforms,
             context,
+            has_stats_parsed_num_records: self.has_stats_parsed_num_records,
         };
         visitor.visit_rows_of(&self.scan_files)?;
         Ok(visitor.context)
@@ -171,23 +172,54 @@ struct ScanFileVisitor<'a, T> {
     callback: ScanCallback<T>,
     transforms: &'a [Option<ExpressionRef>],
     context: T,
+    /// @HStack: when true, the visitor expects an extra leaf at the end of
+    /// `selected_column_names_and_types` carrying `stats_parsed.numRecords`
+    /// and uses it as a fallback when the raw `stats` JSON string is null.
+    /// See kernel `scan_metadata_from` for how this is plumbed.
+    has_stats_parsed_num_records: bool,
 }
 impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
             LazyLock::new(|| SCAN_ROW_SCHEMA.leaves(None));
-        NAMES_AND_TYPES.as_ref()
+        static WIDENED_NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            use crate::schema::{StructField, StructType};
+            let mut fields: Vec<StructField> = SCAN_ROW_SCHEMA.fields().cloned().collect();
+            // Add a sibling top-level `stats_parsed.numRecords` leaf at the end so
+            // existing positional getters[0..14] remain at their current indices and
+            // the new column lands at getters[14]. See the kernel companion
+            // `scan_metadata_from` for the producer side.
+            fields.push(StructField::nullable(
+                "stats_parsed",
+                StructType::new_unchecked(vec![StructField::nullable(
+                    "numRecords",
+                    DataType::LONG,
+                )]),
+            ));
+            StructType::new_unchecked(fields).leaves(None)
+        });
+        if self.has_stats_parsed_num_records {
+            WIDENED_NAMES_AND_TYPES.as_ref()
+        } else {
+            NAMES_AND_TYPES.as_ref()
+        }
     }
     fn visit_filtered<'a>(
         &mut self,
         getters: &[&'a dyn GetData<'a>],
         rows: RowIndexIterator<'_>,
     ) -> DeltaResult<()> {
+        let expected_len = if self.has_stats_parsed_num_records {
+            15
+        } else {
+            14
+        };
         require!(
-            getters.len() == 14,
+            getters.len() == expected_len,
             Error::InternalError(format!(
-                "Wrong number of ScanFileVisitor getters: {}",
-                getters.len()
+                "Wrong number of ScanFileVisitor getters: {} (expected {})",
+                getters.len(),
+                expected_len,
             ))
         );
         for row_index in rows {
@@ -196,7 +228,7 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
                 let size = getters[1].get(row_index, "scanFile.size")?;
                 let modification_time: i64 = getters[2].get(row_index, "add.modificationTime")?;
                 let stats: Option<String> = getters[3].get_opt(row_index, "scanFile.stats")?;
-                let stats: Option<Stats> =
+                let mut stats: Option<Stats> =
                     stats.and_then(|json| match serde_json::from_str(json.as_str()) {
                         Ok(stats) => Some(stats),
                         Err(e) => {
@@ -204,6 +236,22 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
                             None
                         }
                     });
+
+                // @HStack: when raw `stats` was skipped (HSTACK
+                // skip-stats-loading optimization), fall back to the
+                // `stats_parsed.numRecords` leaf plumbed through by
+                // `scan_metadata_from`.
+                if stats.is_none() && self.has_stats_parsed_num_records {
+                    let num_records: Option<i64> =
+                        getters[14].get_opt(row_index, "scanFile.stats_parsed.numRecords")?;
+                    if let Some(num_records) = num_records {
+                        if num_records >= 0 {
+                            stats = Some(Stats {
+                                num_records: num_records as u64,
+                            });
+                        }
+                    }
+                }
 
                 let dv_index = SCAN_ROW_SCHEMA
                     .index_of("deletionVector")

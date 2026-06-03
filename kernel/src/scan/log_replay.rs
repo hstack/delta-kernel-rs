@@ -620,7 +620,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
 /// When `stats_schema` is provided, adds a `stats_parsed` struct column with that schema.
 /// When `partition_schema` is provided, adds a `partitionValues_parsed` struct column with that
 /// schema.
-fn scan_row_schema_with_parsed_columns(
+pub(crate) fn scan_row_schema_with_parsed_columns(
     stats_schema: Option<SchemaRef>,
     partition_schema: Option<SchemaRef>,
 ) -> SchemaRef {
