@@ -33,6 +33,7 @@ pub mod derive_macro_utils;
 pub(crate) mod derive_macro_utils;
 pub(crate) mod validation;
 pub(crate) mod variant_utils;
+pub(crate) mod void_utils;
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
@@ -1745,6 +1746,7 @@ pub enum PrimitiveType {
     #[cfg(feature = "nanosecond-timestamps")]
     #[serde(rename = "timestamp_nanos")]
     TimestampNanos,
+    Void,
     #[serde(serialize_with = "serialize_decimal", untagged)]
     Decimal(DecimalType),
 }
@@ -1853,6 +1855,7 @@ impl<'de> serde::Deserialize<'de> for PrimitiveType {
             "timestamp_ntz" => Ok(PrimitiveType::TimestampNtz),
             #[cfg(feature = "nanosecond-timestamps")]
             "timestamp_nanos" => Ok(PrimitiveType::TimestampNanos),
+            "void" => Ok(PrimitiveType::Void),
             decimal_str if decimal_str.starts_with("decimal(") && decimal_str.ends_with(')') => {
                 // Parse decimal type
                 let mut parts = decimal_str[8..decimal_str.len() - 1].split(',');
@@ -1907,6 +1910,7 @@ impl Display for PrimitiveType {
             PrimitiveType::Decimal(dtype) => {
                 write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
             }
+            PrimitiveType::Void => write!(f, "void"),
         }
     }
 }
@@ -2040,6 +2044,8 @@ impl DataType {
     pub const TIMESTAMP_NTZ: Self = DataType::Primitive(PrimitiveType::TimestampNtz);
     #[cfg(feature = "nanosecond-timestamps")]
     pub const TIMESTAMP_NANOS: Self = DataType::Primitive(PrimitiveType::TimestampNanos);
+    pub const VOID: Self = DataType::Primitive(PrimitiveType::Void);
+
     /// Create a new decimal type with the given precision and scale.
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
         Ok(PrimitiveType::decimal(precision, scale)?.into())
@@ -2425,6 +2431,53 @@ mod tests {
             json_str,
             r#"{"name":"v","type":"variant","nullable":false,"metadata":{}}"#
         );
+    }
+
+    #[test]
+    fn test_roundtrip_void() {
+        let data = r#"
+        {
+            "name": "v",
+            "type": "void",
+            "nullable": true,
+            "metadata": {}
+        }
+        "#;
+        let field: StructField = serde_json::from_str(data).unwrap();
+        assert_eq!(field.data_type, DataType::VOID);
+
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(
+            json_str,
+            r#"{"name":"v","type":"void","nullable":true,"metadata":{}}"#
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_void_non_nullable() {
+        let data = r#"
+        {
+            "name": "v",
+            "type": "void",
+            "nullable": false,
+            "metadata": {}
+        }
+        "#;
+        let field: StructField = serde_json::from_str(data).unwrap();
+        assert_eq!(field.data_type, DataType::VOID);
+        assert!(!field.nullable);
+
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(
+            json_str,
+            r#"{"name":"v","type":"void","nullable":false,"metadata":{}}"#
+        );
+    }
+
+    #[test]
+    fn test_void_display() {
+        assert_eq!(PrimitiveType::Void.to_string(), "void");
+        assert_eq!(DataType::VOID.to_string(), "void");
     }
 
     #[test]
