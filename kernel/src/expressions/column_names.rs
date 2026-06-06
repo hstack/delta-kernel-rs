@@ -462,6 +462,7 @@ pub use __column_expr as column_expr;
 ///   runtime `&str`/`String` is a single-segment column; `col!("a.b", "c")` is two segments.
 ///
 /// ```
+/// # use buoyant_kernel as delta_kernel;
 /// # use delta_kernel::expressions::{col, column_expr, ColumnName, Expression};
 /// // A string literal splits on dots at compile time (same as `column_expr!`).
 /// assert_eq!(col!("a.b.c"), Expression::Column(ColumnName::new(["a", "b", "c"])));
