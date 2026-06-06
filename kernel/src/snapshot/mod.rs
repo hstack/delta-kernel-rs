@@ -141,7 +141,7 @@ impl Snapshot {
     ///
     /// This **can panic**, to catch an error use try_new()
     #[internal_api]
-    #[allow(unused)]
+    #[allow(unused, clippy::expect_used)]
     pub(crate) fn new(
         log_segment: LogSegment,
         table_configuration: TableConfiguration,
