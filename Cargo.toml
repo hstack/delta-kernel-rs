@@ -3,7 +3,6 @@ members = [
     "acceptance",
     "benchmarks",
     "derive-macros",
-    "ffi",
     "kernel",
     "kernel/examples/*",
     "test-utils",
