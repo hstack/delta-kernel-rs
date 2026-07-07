@@ -23,6 +23,7 @@ use crate::crc::{
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
 use crate::log_segment::{DomainMetadataMap, LogSegment};
+use crate::log_segment_files::LogSegmentFiles;
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
 use crate::metrics::MetricId;
 use crate::path::ParsedLogPath;
@@ -68,13 +69,13 @@ pub enum CheckpointWriteResult {
 /// have a defined schema (which may change over time for any given table), specific version, and
 /// frozen log segment.
 pub struct Snapshot {
-    span: tracing::Span,
-    log_segment: LogSegment,
-    table_configuration: TableConfiguration,
+    pub span: tracing::Span,
+    pub log_segment: LogSegment,
+    pub table_configuration: TableConfiguration,
     /// CRC at this snapshot's version, eagerly resolved at construction time. `Some(crc)`
     /// means `crc.version == self.version()` and the CRC can be queried at zero I/O. `None`
     /// means no CRC was loadable (no CRC on disk at this version, or the read failed).
-    crc: Option<Arc<Crc>>,
+    pub crc: Option<Arc<Crc>>,
 }
 
 impl PartialEq for Snapshot {

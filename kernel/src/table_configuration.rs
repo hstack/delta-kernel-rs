@@ -101,9 +101,9 @@ fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) 
 /// the empty `OnceLock`, meaning later schema loads would unnecessarily store independent
 /// copies of the same schema.
 #[derive(Debug, Clone, Eq)]
-struct PhysicalSchemas {
-    full: SchemaRef,
-    without_partition: Arc<OnceLock<SchemaRef>>,
+pub struct PhysicalSchemas {
+    pub full: SchemaRef,
+    pub without_partition: Arc<OnceLock<SchemaRef>>,
 }
 
 impl PhysicalSchemas {
@@ -138,15 +138,15 @@ impl PartialEq for PhysicalSchemas {
 #[internal_api]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableConfiguration {
-    metadata: Metadata,
-    protocol: Protocol,
+    pub metadata: Metadata,
+    pub protocol: Protocol,
     /// Logical schema: field names are the user-facing (logical) column names.
-    logical_schema: SchemaRef,
-    physical_schemas: PhysicalSchemas,
-    table_properties: TableProperties,
-    column_mapping_mode: ColumnMappingMode,
-    table_root: Url,
-    version: Version,
+    pub logical_schema: SchemaRef,
+    pub physical_schemas: PhysicalSchemas,
+    pub table_properties: TableProperties,
+    pub column_mapping_mode: ColumnMappingMode,
+    pub table_root: Url,
+    pub version: Version,
 }
 
 impl TableConfiguration {
