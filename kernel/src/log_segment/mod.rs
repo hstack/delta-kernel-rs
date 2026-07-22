@@ -117,7 +117,7 @@ pub(crate) struct LogSegment {
     /// access use [`Self::checkpoint_hint`] (and the [`Self::checkpoint_schema`] /
     /// [`Self::checkpoint_sidecars`] accessors built on it). Read this field directly only when
     /// the raw hint is wanted as-is -- e.g. re-threading it into a derived segment.
-    pub(crate) last_checkpoint_metadata: Option<LastCheckpointHint>,
+    pub last_checkpoint_metadata: Option<LastCheckpointHint>,
 }
 
 /// Returns the identifying leaf column path for a known action type, used to build IS NOT NULL
