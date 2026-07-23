@@ -115,6 +115,7 @@ pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
 pub mod transforms;
+pub mod hacks;
 
 pub use crc::{FileSizeHistogram, FileStats};
 pub use log_path::LogPath;
