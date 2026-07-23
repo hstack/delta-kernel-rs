@@ -102,20 +102,20 @@ fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) 
 #[internal_api]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableConfiguration {
-    metadata: Metadata,
-    protocol: Protocol,
+    pub metadata: Metadata,
+    pub protocol: Protocol,
     /// Logical schema: field names are the user-facing (logical) column names.
-    logical_schema: SchemaRef,
+    pub logical_schema: SchemaRef,
     /// The subset of the logical schema that remains after excluding partition columns.
-    logical_schema_without_partition_columns: SchemaRef,
+    pub logical_schema_without_partition_columns: SchemaRef,
     /// Physical schema for all columns (field names respect column mapping mode).
-    physical_schema: SchemaRef,
+    pub physical_schema: SchemaRef,
     /// The subset of the physical schema that remains after excluding partition columns.
-    physical_data_schema_without_partition_columns: SchemaRef,
-    table_properties: TableProperties,
-    column_mapping_mode: ColumnMappingMode,
-    table_root: Url,
-    version: Version,
+    pub physical_data_schema_without_partition_columns: SchemaRef,
+    pub table_properties: TableProperties,
+    pub column_mapping_mode: ColumnMappingMode,
+    pub table_root: Url,
+    pub version: Version,
 }
 
 impl TableConfiguration {
@@ -165,7 +165,7 @@ impl TableConfiguration {
         )
     }
 
-    fn try_new_inner(
+    pub fn try_new_inner(
         metadata: Metadata,
         protocol: Protocol,
         table_root: Url,
