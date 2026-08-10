@@ -29,10 +29,11 @@ use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
 #[cfg(feature = "declarative-plans")]
 use crate::plans::ir::nodes::{FileType, ScanFile};
+use crate::scan::log_replay::ScanStatsOptions;
 use crate::schema::compare::SchemaComparison;
 use crate::schema::{
-    lazy_schema_ref, CheckpointFieldKind, DataType, SchemaRef, StructField, StructType,
-    ToSchema as _,
+    lazy_schema_ref, CheckpointFieldKind, DataType, SchemaRef, SchemaStructPatchBuilder,
+    StructField, StructType, ToSchema as _,
 };
 use crate::utils::require;
 #[cfg(feature = "adaptive-metadata-in-dev")]
@@ -132,8 +133,8 @@ pub(crate) struct LogSegment {
     /// The retained `_last_checkpoint` hint, if one was read when this segment was built. The hint
     /// may describe a different checkpoint than the one this segment selected, so for validated
     /// access use [`Self::checkpoint_hint`] (and the [`Self::checkpoint_schema`] /
-    /// [`Self::checkpoint_hint_sidecars`] accessors built on it). Read this field directly only when
-    /// the raw hint is wanted as-is -- e.g. re-threading it into a derived segment.
+    /// [`Self::checkpoint_hint_sidecars`] accessors built on it). Read this field directly only
+    /// when the raw hint is wanted as-is -- e.g. re-threading it into a derived segment.
     pub last_checkpoint_metadata: Option<LastCheckpointHint>,
 }
 
@@ -838,11 +839,8 @@ impl LogSegment {
     ) -> KernelResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = KernelResult<ActionsBatch>> + Send>,
     > {
-        // Combine the action-presence predicate with the caller's skipping predicate so readers
-        // can omit checkpoint data that cannot contain a relevant action.
         let projection_predicate = checkpoint_action_projection_predicate(&checkpoint_read_schema);
-        let checkpoint_predicate =
-            combine_checkpoint_predicates(projection_predicate, meta_predicate);
+        let meta_predicate = combine_checkpoint_predicates(projection_predicate, meta_predicate);
 
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
@@ -852,12 +850,50 @@ impl LogSegment {
         let checkpoint_result = self.create_checkpoint_stream(
             engine,
             checkpoint_read_schema,
-            checkpoint_predicate,
+            meta_predicate,
             stats_schema,
             partition_schema,
+            None,
             cancellation_token,
         )?;
 
+        Ok(ActionsWithCheckpointInfo {
+            actions: commit_stream.chain(checkpoint_result.actions),
+            checkpoint_info: checkpoint_result.checkpoint_info,
+        })
+    }
+
+    /// Reads scan actions using `stats_options` to select checkpoint statistics independently of
+    /// commit statistics. Other arguments follow
+    /// [`Self::read_actions_with_projected_checkpoint_actions`].
+    ///
+    /// Returns action batches and the resolved checkpoint projection, or propagates log-reading
+    /// and schema-projection errors.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn read_actions_with_projected_checkpoint_actions_for_scan(
+        &self,
+        engine: &dyn Engine,
+        commit_read_schema: SchemaRef,
+        checkpoint_read_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+        stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
+        stats_options: &ScanStatsOptions,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> KernelResult<
+        ActionsWithCheckpointInfo<impl Iterator<Item = KernelResult<ActionsBatch>> + Send>,
+    > {
+        let commit_stream =
+            self.read_commit_actions(engine, commit_read_schema, cancellation_token)?;
+        let checkpoint_result = self.create_checkpoint_stream(
+            engine,
+            checkpoint_read_schema,
+            meta_predicate,
+            stats_schema,
+            partition_schema,
+            Some(stats_options),
+            cancellation_token,
+        )?;
         Ok(ActionsWithCheckpointInfo {
             actions: commit_stream.chain(checkpoint_result.actions),
             checkpoint_info: checkpoint_result.checkpoint_info,
@@ -1183,6 +1219,7 @@ impl LogSegment {
     /// 3. Reads checkpoint and sidecar data using cached sidecar refs
     ///
     /// Returns a tuple of the actions iterator and [`CheckpointReadInfo`].
+    #[allow(clippy::too_many_arguments)]
     fn create_checkpoint_stream(
         &self,
         engine: &dyn Engine,
@@ -1190,6 +1227,7 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
+        stats_options: Option<&ScanStatsOptions>,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = KernelResult<ActionsBatch>> + Send>,
@@ -1202,82 +1240,112 @@ impl LogSegment {
             (None, vec![])
         };
 
-        let has_stats_parsed =
-            stats_schema
-                .zip(file_actions_schema.as_ref())
-                .is_some_and(|(stats, file_schema)| {
-                    Self::schema_has_compatible_stats_parsed(file_schema, stats)
-                });
-
+        let available_stats_schema = file_actions_schema
+            .as_ref()
+            .and_then(|schema| schema.field("add"))
+            .and_then(|field| match field.data_type() {
+                DataType::Struct(add) => add.field("stats_parsed"),
+                _ => None,
+            })
+            .and_then(|field| match field.data_type() {
+                DataType::Struct(stats) => Some(stats.as_ref().clone()),
+                _ => None,
+            });
+        let stats_disabled = stats_options.is_some_and(|options| options.skip_stats);
+        let typed_stats_schema = (!stats_disabled).then(|| stats_schema.cloned()).flatten();
+        let has_stats_parsed = typed_stats_schema
+            .as_ref()
+            .zip(file_actions_schema.as_ref())
+            .is_some_and(|(stats, file_schema)| {
+                Self::schema_has_compatible_stats_parsed(file_schema, stats)
+            });
+        let projected_stats_schema = if has_stats_parsed {
+            typed_stats_schema.clone()
+        } else if stats_options
+            .is_some_and(|options| !options.skip_stats && options.synthesize_json)
+        {
+            available_stats_schema
+        } else {
+            None
+        };
         let has_partition_values_parsed = partition_schema
             .zip(file_actions_schema.as_ref())
             .is_some_and(|(ps, fs)| Self::schema_has_compatible_partition_values_parsed(fs, ps));
 
-        // JSON checkpoint stats are required when structured stats cannot satisfy the scan schema.
-        let needs_json_stats_fallback = stats_schema.is_some()
-            && !has_stats_parsed
-            && action_schema.field("add").is_some_and(|field| {
-                let DataType::Struct(add) = field.data_type() else {
-                    return false;
-                };
-                add.field("stats").is_none()
-            });
-
-        let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
-        let needs_add_augmentation =
-            needs_json_stats_fallback || has_stats_parsed || has_partition_values_parsed;
-        let augmented_checkpoint_read_schema = if needs_add_augmentation || needs_sidecar {
-            let mut new_fields: Vec<StructField> = if let (true, Some(add_field)) =
-                (needs_add_augmentation, action_schema.field("add"))
-            {
-                let DataType::Struct(add_struct) = add_field.data_type() else {
-                    return Err(KernelError::internal_error(
-                        "add field in action schema must be a struct",
-                    ));
-                };
-                let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
-
-                if needs_json_stats_fallback {
-                    add_fields.push(StructField::nullable("stats", DataType::STRING));
-                }
-
-                if let (true, Some(ss)) = (has_stats_parsed, stats_schema) {
-                    add_fields.push(StructField::nullable("stats_parsed", ss.clone()));
-                }
-
-                if let (true, Some(ps)) = (has_partition_values_parsed, partition_schema) {
-                    add_fields.push(StructField::nullable("partitionValues_parsed", ps.clone()));
-                }
-
-                // Rebuild schema with modified add field
-                action_schema
-                    .fields()
-                    .map(|f| {
-                        if f.name() == "add" {
-                            StructField::new(
-                                add_field.name(),
-                                StructType::new_unchecked(add_fields.clone()),
-                                add_field.is_nullable(),
-                            )
-                            .with_metadata(add_field.metadata.clone())
-                        } else {
-                            f.clone()
-                        }
-                    })
-                    .collect()
-            } else {
-                action_schema.fields().cloned().collect()
+        let has_raw_stats = action_schema.field("add").is_some_and(|field| {
+            let DataType::Struct(add) = field.data_type() else {
+                return false;
             };
+            add.field("stats").is_some()
+        });
+        let read_raw_stats = stats_options.map_or(
+            has_raw_stats || (stats_schema.is_some() && !has_stats_parsed),
+            |options| {
+                !options.skip_stats
+                    && (options.synthesize_json
+                        || (options.checkpoint_stats_json_fallback
+                            && typed_stats_schema.is_some()
+                            && !has_stats_parsed))
+            },
+        );
+
+        let needs_sidecar =
+            need_file_actions && !sidecar_files.is_empty() && !action_schema.contains(SIDECAR_NAME);
+        let needs_add_augmentation = stats_options.is_some()
+            || read_raw_stats != has_raw_stats
+            || projected_stats_schema.is_some()
+            || has_partition_values_parsed;
+        let augmented_checkpoint_read_schema = if needs_add_augmentation || needs_sidecar {
+            let mut builder = SchemaStructPatchBuilder::new();
+
+            if needs_add_augmentation && action_schema.contains("add") {
+                builder = builder
+                    .drop_if_exists_at(["add"], "stats_parsed")
+                    .drop_if_exists_at(["add"], "partitionValues_parsed");
+                if !read_raw_stats {
+                    builder = builder.drop_if_exists_at(["add"], "stats");
+                } else if !has_raw_stats {
+                    builder = builder
+                        .append_at(["add"], StructField::nullable("stats", DataType::STRING));
+                }
+
+                if let Some(stats_schema) = projected_stats_schema.as_ref() {
+                    builder = builder.append_at(
+                        ["add"],
+                        StructField::nullable("stats_parsed", stats_schema.clone()),
+                    );
+                }
+                if let (true, Some(partition_schema)) =
+                    (has_partition_values_parsed, partition_schema)
+                {
+                    builder = builder.append_at(
+                        ["add"],
+                        StructField::nullable("partitionValues_parsed", partition_schema.clone()),
+                    );
+                }
+            }
 
             // Add sidecar column at top-level for V2 checkpoints
             if needs_sidecar {
-                new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
+                builder = builder.append(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
             }
 
-            Arc::new(StructType::new_unchecked(new_fields))
+            Arc::new(builder.build(&action_schema)?)
         } else {
             // No modifications needed, use schema as-is
             action_schema.clone()
+        };
+
+        let effective_predicate = if stats_options.is_some() {
+            // Sidecar references are already cached. Keep pruning scoped to requested actions,
+            // not the sidecar column added to the physical read schema.
+            let projection_predicate = checkpoint_action_projection_predicate(&action_schema);
+            let meta_predicate = (typed_stats_schema.is_none() || has_stats_parsed)
+                .then_some(meta_predicate)
+                .flatten();
+            combine_checkpoint_predicates(projection_predicate, meta_predicate)
+        } else {
+            meta_predicate
         };
 
         let checkpoint_file_meta: Vec<_> = self
@@ -1296,7 +1364,7 @@ impl LogSegment {
                 engine.json_handler().read_json_files_with_cancellation(
                     &checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
-                    meta_predicate.clone(),
+                    effective_predicate.clone(),
                     cancellation_token.cloned(),
                 )?
             }
@@ -1305,7 +1373,7 @@ impl LogSegment {
                 .read_parquet_files_with_cancellation(
                     &checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
-                    meta_predicate.clone(),
+                    effective_predicate.clone(),
                     cancellation_token.cloned(),
                 )?,
             Some(parsed_log_path) => {
@@ -1329,7 +1397,7 @@ impl LogSegment {
                 .read_parquet_files_with_cancellation(
                     &sidecar_files,
                     augmented_checkpoint_read_schema.clone(),
-                    meta_predicate,
+                    effective_predicate,
                     cancellation_token.cloned(),
                 )?
         } else {

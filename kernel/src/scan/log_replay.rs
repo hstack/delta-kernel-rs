@@ -10,7 +10,7 @@ use url::Url;
 use super::data_skipping::DataSkippingFilter;
 use super::metrics::ScanMetrics;
 use super::state_info::{ResolvedPhysicalStatsSchemas, StateInfo};
-use super::{PhysicalPredicate, ScanMetadata, COMMIT_READ_SCHEMA};
+use super::{PhysicalPredicate, ScanMetadata};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{EngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{
@@ -46,6 +46,14 @@ pub(crate) struct ScanStatsOptions {
     /// is left null on such checkpoints; engines that consume `stats_parsed` directly
     /// avoid reading JSON stats in checkpoints and the per-batch `ToJson` cost.
     pub(crate) synthesize_json: bool,
+    /// Allow typed statistics to fall back to raw checkpoint JSON when a compatible
+    /// `stats_parsed` struct is unavailable.
+    #[serde(default = "default_checkpoint_stats_json_fallback")]
+    pub(crate) checkpoint_stats_json_fallback: bool,
+}
+
+fn default_checkpoint_stats_json_fallback() -> bool {
+    true
 }
 
 impl Default for ScanStatsOptions {
@@ -53,6 +61,7 @@ impl Default for ScanStatsOptions {
         Self {
             skip_stats: false,
             synthesize_json: true,
+            checkpoint_stats_json_fallback: true,
         }
     }
 }
@@ -256,10 +265,19 @@ impl ScanLogReplayProcessor {
             has_partition_values_parsed,
             checkpoint_read_schema,
         } = checkpoint_info.clone();
-        let ScanStatsOptions {
-            skip_stats,
-            synthesize_json,
-        } = stats_options;
+        let skip_stats = stats_options.skip_stats;
+
+        let has_add_field = |schema: &StructType, name| {
+            schema
+                .field("add")
+                .and_then(|field| match field.data_type() {
+                    DataType::Struct(add) => add.field(name),
+                    _ => None,
+                })
+                .is_some()
+        };
+        let has_raw_checkpoint_stats = has_add_field(&checkpoint_read_schema, "stats");
+        let has_stats_parsed_for_json = has_add_field(&checkpoint_read_schema, STATS_PARSED_NAME);
 
         // Create metrics first so we can pass them to DataSkippingFilter
         let metrics = Arc::new(ScanMetrics::default());
@@ -290,13 +308,13 @@ impl ScanLogReplayProcessor {
                 None
             };
 
-        let output_schema = scan_row_schema_with_parsed_columns(
+        let replay_schema = scan_row_schema_with_parsed_columns(
             stats_schema_for_transform.clone(),
             partition_schema_for_transform.clone(),
         )?;
         let stats_output_projection = build_stats_output_projection(
             engine,
-            output_schema.clone(),
+            replay_schema.clone(),
             state_info.physical_stats_output_schema().map(AsRef::as_ref),
         )?;
 
@@ -320,39 +338,46 @@ impl ScanLogReplayProcessor {
                 // The transform flattens `add.*` to top-level columns, so `path` is non-null
                 // exactly for Add rows.
                 Arc::new(Predicate::is_not_null(col!("path")).into()),
-                output_schema.clone(),
+                replay_schema.clone(),
                 &state_info.eligible_physical_stats_columns,
                 Some(metrics.clone()),
             )
         };
 
+        let commit_read_schema = super::commit_read_schema(skip_stats);
+        let has_raw_commit_stats = has_add_field(&commit_read_schema, "stats");
+
         Ok(Self {
             data_skipping_filter,
             // Commit transform: parse JSON for stats, MapToStruct for partition values
             commit_transform: engine.evaluation_handler().new_expression_evaluator(
-                COMMIT_READ_SCHEMA.clone(),
+                commit_read_schema,
                 get_add_transform_expr(
                     stats_schema_for_transform.clone(),
+                    has_raw_commit_stats,
+                    true,
                     false,
-                    skip_stats,
-                    synthesize_json,
+                    false,
+                    &stats_options,
                     partition_schema_for_transform.clone(),
                     false,
                 ),
-                output_schema.clone().into(),
+                replay_schema.clone().into(),
             )?,
             // Checkpoint transform: read pre-parsed columns directly when available
             checkpoint_transform: engine.evaluation_handler().new_expression_evaluator(
                 checkpoint_read_schema,
                 get_add_transform_expr(
-                    stats_schema_for_transform,
+                    stats_schema_for_transform.clone(),
+                    has_raw_checkpoint_stats,
+                    stats_options.checkpoint_stats_json_fallback,
                     has_stats_parsed,
-                    skip_stats,
-                    synthesize_json,
-                    partition_schema_for_transform,
+                    has_stats_parsed_for_json,
+                    &stats_options,
+                    partition_schema_for_transform.clone(),
                     has_partition_values_parsed,
                 ),
-                output_schema.into(),
+                replay_schema.clone().into(),
             )?,
             stats_output_projection,
             seen_file_keys,
@@ -819,6 +844,36 @@ pub(crate) static STATS_PARSED_NAME: &str = "stats_parsed";
 #[internal_api]
 pub(crate) static PARTITION_VALUES_PARSED_NAME: &str = "partitionValues_parsed";
 
+fn project_nested_struct(
+    input_schema: &StructType,
+    output_schema: &StructType,
+    path: &ColumnName,
+) -> ExpressionRef {
+    let fields = output_schema.fields().map(|field| {
+        let field_path = path.join(&ColumnName::new([field.name()]));
+        let input_field = input_schema.field(field.name());
+        match (field.data_type(), input_field.map(StructField::data_type)) {
+            (DataType::Struct(output_child), Some(DataType::Struct(input_child))) => {
+                project_nested_struct(input_child, output_child, &field_path)
+            }
+            (DataType::Primitive(output), Some(DataType::Primitive(input)))
+                if input != output && input.can_widen_to(output) =>
+            {
+                Arc::new(Expression::cast(
+                    Expression::column(field_path),
+                    DataType::Primitive(output.clone()),
+                ))
+            }
+            // Compatible legacy checkpoints may omit any requested statistics field. Preserve
+            // the requested shape and represent every unavailable value as null.
+            (data_type, None) => Arc::new(null_lit(data_type.clone())),
+            _ => Arc::new(Expression::column(field_path)),
+        }
+    });
+    let is_present = Arc::new(Predicate::is_not_null(Expression::column(path.clone())).into());
+    Arc::new(Expression::struct_with_nullability_from(fields, is_present))
+}
+
 // NB: If you update this schema, ensure you update the comment describing it in the doc comment
 // for `scan_row_schema` in scan/mod.rs! You'll also need to update ScanFileVisitor as the
 // indexes will be off, and [`get_add_transform_expr`] below to match it.
@@ -846,7 +901,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
 /// regardless of the engine's options, and keeps data-skipping paths uniform:
 /// `partitionValues_parsed.<col>` parallels `stats_parsed.minValues.<col>`. The checkpoint source
 /// is also `add.partitionValues_parsed`, a sibling of `add.stats_parsed`.
-fn scan_row_schema_with_parsed_columns(
+pub(super) fn scan_row_schema_with_parsed_columns(
     stats_schema: Option<SchemaRef>,
     partition_schema: Option<SchemaRef>,
 ) -> KernelResult<SchemaRef> {
@@ -910,15 +965,12 @@ fn build_stats_output_projection(
 /// # Parameters
 /// - `physical_stats_read_schema`: Schema for parsing stats from JSON for data skipping and
 ///   structured output, or None if structured stats are not needed.
-/// - `has_stats_parsed`: Whether checkpoint has pre-parsed stats_parsed column. When true and
-///   `synthesize_json` is true, stats output uses `COALESCE(add.stats, ToJson(add.stats_parsed))`
-///   so that `ScanFile.stats` is populated even when the checkpoint lacks JSON stats
-///   (writeStatsAsJson=false).
-/// - `skip_stats`: When true, replaces the stats column with a null literal, avoiding reads of the
-///   JSON stats column in checkpoint parquet files.
-/// - `synthesize_json`: When false, disables the `ToJson(add.stats_parsed)` fallback regardless of
-///   `has_stats_parsed`. Compatible parsed-stats checkpoints produce null JSON stats and can omit
-///   the JSON stats column; JSON-only checkpoints and commits retain `add.stats` as fallback input.
+/// - `has_raw_stats`: Whether the selected source schema contains `add.stats`.
+/// - `allow_raw_stats_for_typed`: Whether raw JSON may be parsed as typed statistics.
+/// - `has_typed_stats_parsed`: Whether checkpoint `stats_parsed` matches the replay schema.
+/// - `has_stats_parsed_for_json`: Whether the source contains `stats_parsed` for JSON synthesis,
+///   independently of typed replay compatibility.
+/// - `stats_options`: Controls statistics replay and JSON synthesis.
 /// - `partition_schema`: Schema of typed partition columns for data skipping, or None if partition
 ///   value parsing is not needed.
 /// - `has_partition_values_parsed`: Whether the source carries a native `partitionValues_parsed`
@@ -928,28 +980,31 @@ fn build_stats_output_projection(
 /// The transform includes `stats_parsed` only when `physical_stats_read_schema` is Some,
 /// and `partitionValues_parsed` only when `partition_schema` is Some.
 /// Stats are output using physical column names.
+#[allow(clippy::too_many_arguments)]
 fn get_add_transform_expr(
     physical_stats_read_schema: Option<SchemaRef>,
-    has_stats_parsed: bool,
-    skip_stats: bool,
-    synthesize_json: bool,
+    has_raw_stats: bool,
+    allow_raw_stats_for_typed: bool,
+    has_typed_stats_parsed: bool,
+    has_stats_parsed_for_json: bool,
+    stats_options: &ScanStatsOptions,
     partition_schema: Option<SchemaRef>,
     has_partition_values_parsed: bool,
 ) -> ExpressionRef {
-    let stats_expr = if skip_stats {
-        Arc::new(null_lit(DataType::STRING))
-    } else if has_stats_parsed && synthesize_json {
-        // Checkpoint may lack JSON stats when writeStatsAsJson=false. Fall back to
-        // serializing stats_parsed so ScanFile.stats is populated either way.
-        Arc::new(Expression::coalesce([
-            col!("add.stats"),
-            Expression::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed")),
-        ]))
-    } else if has_stats_parsed {
-        // The compatible checkpoint projection can omit add.stats when JSON output is disabled.
-        Arc::new(null_lit(DataType::STRING))
-    } else {
+    let null_stats = || Arc::new(null_lit(DataType::STRING));
+    let stats_expr = if stats_options.skip_stats {
+        null_stats()
+    } else if stats_options.synthesize_json && has_stats_parsed_for_json {
+        let parsed_json = Expression::unary(UnaryExpressionOp::ToJson, col!("add.stats_parsed"));
+        if has_raw_stats {
+            Arc::new(Expression::coalesce([col!("add.stats"), parsed_json]))
+        } else {
+            Arc::new(parsed_json)
+        }
+    } else if has_raw_stats {
         column_expr_ref!("add.stats")
+    } else {
+        null_stats()
     };
     let mut fields = vec![
         column_expr_ref!("add.path"),
@@ -968,12 +1023,14 @@ fn get_add_transform_expr(
 
     // Add stats_parsed when needed for data skipping or connector output.
     if let Some(stats_schema) = physical_stats_read_schema {
-        let stats_parsed_expr = if has_stats_parsed {
+        let stats_parsed_expr = if has_typed_stats_parsed {
             // Checkpoint has stats_parsed column - read directly
             col!("add.stats_parsed")
-        } else {
+        } else if has_raw_stats && allow_raw_stats_for_typed {
             // No stats_parsed available (JSON log files) - parse JSON
             Expression::parse_json(col!("add.stats"), stats_schema)
+        } else {
+            null_lit(stats_schema.as_ref().clone())
         };
         fields.push(Arc::new(stats_parsed_expr));
     }
@@ -1015,6 +1072,32 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
         )]))
     });
     EXPR.clone()
+}
+
+pub(super) fn get_scan_metadata_transform_expr_with_parsed_columns(
+    available_stats_schema: &StructType,
+    effective_replay_stats_schema: &StructType,
+) -> ExpressionRef {
+    let stats_path = ColumnName::new([STATS_PARSED_NAME]);
+    Arc::new(Expression::struct_from([Arc::new(
+        Expression::struct_from([
+            column_expr_ref!("path"),
+            column_expr_ref!("fileConstantValues.partitionValues"),
+            column_expr_ref!("size"),
+            column_expr_ref!("modificationTime"),
+            column_expr_ref!("stats"),
+            column_expr_ref!("fileConstantValues.tags"),
+            column_expr_ref!("deletionVector"),
+            column_expr_ref!("fileConstantValues.baseRowId"),
+            column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
+            column_expr_ref!("fileConstantValues.clusteringProvider"),
+            project_nested_struct(
+                available_stats_schema,
+                effective_replay_stats_schema,
+                &stats_path,
+            ),
+        ]),
+    )]))
 }
 
 impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
@@ -1112,8 +1195,12 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
         };
         self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
         let transformed_actions = self.project_stats_output(transformed_actions)?;
-        let scan_metadata =
-            ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
+        let scan_metadata = ScanMetadata::try_new(
+            transformed_actions,
+            final_selection,
+            row_transform_exprs,
+            self.state_info.physical_stats_output_schema(),
+        )?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
         Ok(scan_metadata)
@@ -1220,8 +1307,12 @@ impl ScanLogReplayProcessor {
         };
         self.record_selected_add_files(&final_selection, &active_add_file_sizes)?;
         let transformed_actions = self.project_stats_output(transformed_actions)?;
-        let scan_metadata =
-            ScanMetadata::try_new(transformed_actions, final_selection, row_transform_exprs)?;
+        let scan_metadata = ScanMetadata::try_new(
+            transformed_actions,
+            final_selection,
+            row_transform_exprs,
+            self.state_info.physical_stats_output_schema(),
+        )?;
         self.metrics
             .update_peak_hash_set_size(self.seen_file_keys.len());
         Ok(scan_metadata)
@@ -1274,6 +1365,9 @@ pub(crate) fn scan_action_iter(
         .filter_ok(HasSelectionVector::has_selected_rows);
     Ok((action_iter, metrics))
 }
+
+#[cfg(test)]
+mod stats_expression_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2400,9 +2494,15 @@ mod tests {
         // Synthesis enabled: COALESCE branch present -> exactly one ToJson.
         let with_synthesis = get_add_transform_expr(
             Some(stats_schema.clone()),
-            true,  // has_stats_parsed
-            false, // skip_stats
-            true,  // synthesize_json
+            true, // has_raw_stats
+            true, // allow_raw_stats_for_typed
+            true, // has_typed_stats_parsed
+            true, // has_stats_parsed_for_json
+            &ScanStatsOptions {
+                skip_stats: false,
+                synthesize_json: true,
+                ..Default::default()
+            },
             partition_schema.clone(),
             false, // has_partition_values_parsed
         );
@@ -2415,9 +2515,15 @@ mod tests {
         // Synthesis disabled: no ToJson anywhere in the transform.
         let without_synthesis = get_add_transform_expr(
             Some(stats_schema),
-            true,  // has_stats_parsed
-            false, // skip_stats
-            false, // synthesize_json
+            false, // has_raw_stats
+            true,  // allow_raw_stats_for_typed
+            true,  // has_typed_stats_parsed
+            true,  // has_stats_parsed_for_json
+            &ScanStatsOptions {
+                skip_stats: false,
+                synthesize_json: false,
+                ..Default::default()
+            },
             partition_schema,
             false, // has_partition_values_parsed
         );

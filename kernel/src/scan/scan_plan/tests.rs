@@ -833,7 +833,12 @@ fn declarative_metadata_partition_values_prune_without_struct_stats(
     assert!(scan.state_info.physical_stats_read_schema().is_none());
     let actual = declarative_metadata(&scan, engine.as_ref())?;
 
-    assert_metadata_eq(&actual, &expected, "partition pruning")
+    // Declarative plans do not synthesize JSON stats from structured-only checkpoints.
+    assert_metadata_eq(
+        &without_columns(&actual, &[STATS])?,
+        &without_columns(&expected, &[STATS])?,
+        "partition pruning",
+    )
 }
 
 #[test]
