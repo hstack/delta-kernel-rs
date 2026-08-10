@@ -1317,6 +1317,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None, // stats_options
         None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
@@ -1391,6 +1392,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None, // stats_options
         None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
@@ -1457,6 +1459,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None, // stats_options
         None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
@@ -1720,6 +1723,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None, // stats_options
         None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
@@ -1813,6 +1817,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None, // stats_options
         None, // cancellation_token
     )?;
     let mut iter = checkpoint_result.actions;
@@ -3848,6 +3853,10 @@ async fn test_checkpoint_stream_resolves_stats_projection(
         None, // meta_predicate
         Some(&stats_schema),
         None, // partition_schema
+        Some(&ScanStatsOptions {
+            synthesize_json: false,
+            ..Default::default()
+        }),
         None, // cancellation_token
     )?;
 
@@ -4560,6 +4569,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> KernelResu
         None, // meta_predicate
         None, // stats_schema
         Some(&partition_schema),
+        None, // stats_options
         None, // cancellation_token
     )?;
 
@@ -4625,6 +4635,7 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
         None,
         None,
         Some(&partition_schema),
+        None, // stats_options
         None, // cancellation_token
     )?;
 

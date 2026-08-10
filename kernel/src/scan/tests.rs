@@ -42,6 +42,7 @@ use crate::{
 
 #[cfg(feature = "geo-type-in-dev")]
 mod geometry_stats;
+mod stats_read_policy;
 mod variant_stats;
 
 fn field_names(s: &StructArray) -> Vec<String> {
@@ -693,7 +694,13 @@ fn test_scan_metadata_from_same_version() {
         .try_collect()
         .unwrap();
     let new_files: Vec<_> = scan
-        .scan_metadata_from(engine.as_ref(), version, files, None)
+        .scan_metadata_from(
+            engine.as_ref(),
+            version,
+            None,
+            files.into_iter().map(Ok),
+            None,
+        )
         .unwrap()
         .try_collect()
         .unwrap();
@@ -726,7 +733,13 @@ fn scan_metadata_from_cancels_cached_metadata_consumption() {
         .build()
         .unwrap();
     let mut metadata = scan
-        .scan_metadata_from(engine.as_ref(), version, files, None)
+        .scan_metadata_from(
+            engine.as_ref(),
+            version,
+            None,
+            files.into_iter().map(Ok),
+            None,
+        )
         .unwrap();
 
     token.cancel();
@@ -771,7 +784,7 @@ fn test_scan_metadata_from_with_update() {
         .unwrap();
     let scan = snapshot.scan_builder().build().unwrap();
     let new_files: Vec<_> = scan
-        .scan_metadata_from(engine.as_ref(), 0, files, None)
+        .scan_metadata_from(engine.as_ref(), 0, None, files.into_iter().map(Ok), None)
         .unwrap()
         .map_ok(|ScanMetadata { scan_files, .. }| {
             let (underlying_data, selection_vector) = scan_files.into_parts();
