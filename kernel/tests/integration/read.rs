@@ -2182,13 +2182,13 @@ fn checkpoint_stats_skipping(
 // writeStatsAsStruct=true, writeStatsAsJson=false (no JSON stats in checkpoint),
 // schema (id: long, value: string), 5 files with 1 row each, checkpoint at v5.
 // Cross-product covers all five checkpoint variants against four stats option
-// shapes: ScanFile.stats should be populated via the COALESCE/ToJson fallback
-// when both `json=true` and `struct_stats=All` are set; otherwise null on these
-// struct-stats-only checkpoints.
+// shapes: JSON output synthesizes stats from typed checkpoint values, while
+// struct-only output uses the typed numRecords fallback. With no requested
+// statistics, ScanFile.stats remains null.
 #[rstest::rstest]
-#[case::default_json_only(StatsOptions::default(), false)]
+#[case::default_json_only(StatsOptions::default(), true)]
 #[case::all_both(StatsOptions::all(), true)]
-#[case::all_struct_only(StatsOptions::all_struct(), false)]
+#[case::all_struct_only(StatsOptions::all_struct(), true)]
 #[case::none(StatsOptions::none(), false)]
 fn struct_stats_surfaced_in_scan_file(
     #[values(
@@ -2312,9 +2312,10 @@ fn struct_stats_only_preserves_data_skipping(
         "data skipping via stats_parsed should leave only 2 files (id=4, id=5)"
     );
     for scan_file in &scan_files {
-        assert!(
-            scan_file.stats.is_none(),
-            "ScanFile.stats must remain null when synthesis is skipped, path: {}",
+        assert_eq!(
+            scan_file.stats.as_ref().map(|stats| stats.num_records),
+            Some(1),
+            "ScanFile.stats must contain num_records=1 from typed stats_parsed fallback, not JSON synthesis, path: {}",
             scan_file.path
         );
     }

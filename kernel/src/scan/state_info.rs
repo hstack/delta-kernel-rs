@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tracing::{debug, enabled, warn, Level};
 
-use crate::actions::NULL_COUNT;
+use crate::actions::{NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::expressions::ColumnName;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::transform_spec::{FieldTransformSpec, TransformSpec};
@@ -121,112 +121,90 @@ fn validate_metadata_columns<'a>(
     Ok(metadata_info)
 }
 
-/// Build data-skipping schemas based on `StructStats` and `PhysicalPredicate`.
-///
-/// Returns `(physical_stats_schema, physical_partition_schema)`, where:
-/// - `physical_stats_schema` contains data-column stats for `stats_parsed`.
-/// - `physical_partition_schema` contains typed partition values for `partitionValues_parsed`.
-///
-/// All three arms route through `TableConfiguration::build_expected_stats_schemas`: the
-/// `All` arm with no `requested_physical_columns` filter, and the two scoped arms with
-/// the union of requested + predicate-referenced columns. That path applies the same
-/// `BaseStatsTransform` -> `MinMaxStatsTransform` pipeline writers use, so the read-side
-/// stats schema's shape matches the write-side exactly.
 fn build_data_skipping_schemas(
     struct_stats: &StructStats,
     physical_predicate: &PhysicalPredicate,
     predicate_column_names_logical: &[ColumnName],
     table_configuration: &TableConfiguration,
-    table_partition_schema: Option<SchemaRef>,
-) -> DeltaResult<(Option<SchemaRef>, Option<SchemaRef>)> {
-    // Filter partition schema to only predicate-referenced columns. The DataSkippingFilter
-    // only needs partition columns that appear in the predicate, and the transform output
-    // should not include unused partition columns.
-    let predicate_partition_schema = match (&table_partition_schema, physical_predicate) {
-        (Some(tps), PhysicalPredicate::Some(_, ref_schema)) => {
-            // Partition values extracted from the string map via MapToStruct are always
-            // nullable (map lookup can return null), so we force all partition fields nullable.
-            ref_schema
-                .with_fields_filtered_nonempty(|f| tps.field(f.name()).is_some())?
-                .map(|partition_schema| {
-                    let nullable_fields = partition_schema
-                        .fields()
-                        .map(|f| StructField::nullable(f.name(), f.data_type().clone()));
-                    Arc::new(StructType::new_unchecked(nullable_fields))
-                })
-        }
-        _ => None,
+) -> DeltaResult<Option<SchemaRef>> {
+    let logical_schema = table_configuration.logical_schema();
+    let physical_schema = table_configuration.physical_schema();
+    let column_mapping_mode = table_configuration.column_mapping_mode();
+    let resolve_logical_path = |column: &ColumnName| {
+        get_any_level_column_physical_name(&logical_schema, column, column_mapping_mode)
+            .inspect_err(|error| {
+                warn!("Failed to resolve physical name for column {column}: {error}")
+            })
+            .ok()
     };
-
-    // `DataSkippingFilter` needs stats for every column its predicate references. Refs
-    // without stats fold to NULL and pruning collapses to "keep every file", even when
-    // the caller separately requested stats for some other set of columns via
-    // `StructStats::Columns`. Union the two so the schema serves both. Unresolvable
-    // refs (e.g. a predicate typo) are dropped here.
-    let union_to_physical = |requested_logical: &[ColumnName]| -> Vec<ColumnName> {
-        let mut union_logical: Vec<ColumnName> = requested_logical.to_vec();
-        let existing: HashSet<&ColumnName> = requested_logical.iter().collect();
-        for col in predicate_column_names_logical {
-            if !existing.contains(col) {
-                union_logical.push(col.clone());
-            }
-        }
-        let logical_schema = table_configuration.logical_schema();
-        let column_mapping_mode = table_configuration.column_mapping_mode();
-        union_logical
+    let logical_to_physical = |columns: &[ColumnName]| -> Vec<ColumnName> {
+        columns.iter().filter_map(&resolve_logical_path).collect()
+    };
+    let requested_to_physical = |columns: &[ColumnName]| -> Vec<ColumnName> {
+        columns
             .iter()
-            .filter_map(|col| {
-                get_any_level_column_physical_name(&logical_schema, col, column_mapping_mode)
-                    .inspect_err(|e| warn!("Failed to resolve physical name for column {col}: {e}"))
-                    .ok()
+            .filter_map(|column| {
+                if physical_schema.field_at(column).is_ok() {
+                    Some(column.clone())
+                } else {
+                    resolve_logical_path(column)
+                }
             })
             .collect()
     };
-
-    // A stats schema with only `numRecords` and `tightBounds` (the bookkeeping fields
-    // `build_expected_stats_schemas` always emits) has nothing to prune by. Return `None`
-    // in that case so the caller skips building a `DataSkippingFilter`. `nullCount` is the
-    // per-column stats wrapper, so its presence is the signal that at least one data
-    // column survived. The Delta protocol allows `minValues` / `maxValues` without
-    // `nullCount`, but `build_expected_stats_schemas` always emits `nullCount` whenever it
-    // emits min/max; this check relies on that implementation property.
-    let with_data_cols = |stats_schema: SchemaRef| -> Option<SchemaRef> {
-        stats_schema
-            .field(NULL_COUNT)
-            .is_some()
-            .then_some(stats_schema)
+    let build_selected_stats_schema = |columns: &[ColumnName]| -> DeltaResult<SchemaRef> {
+        if columns.is_empty() {
+            return Ok(Arc::new(StructType::new_unchecked([
+                StructField::nullable(NUM_RECORDS, DataType::LONG),
+                StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
+            ])));
+        }
+        Ok(table_configuration
+            .build_expected_stats_schemas(None, Some(columns))?
+            .physical)
     };
 
-    let stats_schema = match (struct_stats, physical_predicate) {
-        // Full table stats schema for stats_parsed.
-        (StructStats::All, _) => with_data_cols(
+    // Requested paths may already be physical. Otherwise, resolve them as logical paths. Predicate
+    // paths are always logical and are physicalized exactly once.
+    let requested_physical_columns = match struct_stats {
+        StructStats::Columns(columns) => Some(requested_to_physical(columns)),
+        _ => None,
+    };
+    let predicate_physical_columns =
+        if matches!(physical_predicate, PhysicalPredicate::Some(_, _)) {
+            logical_to_physical(predicate_column_names_logical)
+        } else {
+            Vec::new()
+        };
+
+    let physical_stats_schema = match (struct_stats, requested_physical_columns) {
+        (StructStats::All, _) => Some(
             table_configuration
                 .build_expected_stats_schemas(None, None)?
                 .physical,
         ),
-        // Explicit requested columns. Union in predicate refs so the stats schema covers
-        // both sources.
-        (StructStats::Columns(requested_columns), _) if !requested_columns.is_empty() => {
-            let requested_physical = union_to_physical(requested_columns);
-            with_data_cols(
-                table_configuration
-                    .build_expected_stats_schemas(None, Some(&requested_physical))?
-                    .physical,
-            )
+        (StructStats::Columns(_), Some(mut replay_physical_columns)) => {
+            for predicate_column in predicate_physical_columns {
+                if !replay_physical_columns.contains(&predicate_column) {
+                    replay_physical_columns.push(predicate_column);
+                }
+            }
+            Some(build_selected_stats_schema(&replay_physical_columns)?)
         }
-        // No explicit requested columns, but a predicate is present. Use just the predicate
-        // refs so the stats schema is trimmed to what the rewritten predicate needs.
-        (_, PhysicalPredicate::Some(_, _)) => {
-            let predicate_refs_physical = union_to_physical(&[]);
-            with_data_cols(
-                table_configuration
-                    .build_expected_stats_schemas(None, Some(&predicate_refs_physical))?
-                    .physical,
-            )
+        (StructStats::Columns(_), None) => unreachable!(),
+        (StructStats::None, _) if predicate_physical_columns.is_empty() => None,
+        (StructStats::None, _) => {
+            let stats_schema = table_configuration
+                .build_expected_stats_schemas(None, Some(&predicate_physical_columns))?
+                .physical;
+            stats_schema
+                .field(NULL_COUNT)
+                .is_some()
+                .then_some(stats_schema)
         }
-        (_, _) => None,
     };
-    Ok((stats_schema, predicate_partition_schema))
+
+    Ok(physical_stats_schema)
 }
 
 impl StateInfo {
@@ -384,6 +362,13 @@ impl StateInfo {
             }
         }
 
+        let physical_stats_schema = build_data_skipping_schemas(
+            &stats.struct_stats,
+            &physical_predicate,
+            &predicate_column_names,
+            table_configuration,
+        )?;
+
         // Build partition schema with physical names, used for partition pruning in data
         // skipping and for the engine-facing `partitionValues_parsed` output column. Needed
         // when partition columns exist and either a predicate is present or the engine
@@ -414,13 +399,24 @@ impl StateInfo {
                 None
             };
 
-        let (physical_stats_schema, predicate_partition_schema) = build_data_skipping_schemas(
-            &stats.struct_stats,
-            &physical_predicate,
-            &predicate_column_names,
-            table_configuration,
-            table_partition_schema.clone(),
-        )?;
+        // Filter partition schema to only predicate-referenced columns. The DataSkippingFilter
+        // only needs partition columns that appear in the predicate, and the transform output
+        // should not include unused partition columns.
+        let predicate_partition_schema = match (&table_partition_schema, &physical_predicate) {
+            (Some(tps), PhysicalPredicate::Some(_, ref_schema)) => {
+                // Partition values extracted from the string map via MapToStruct are always
+                // nullable (map lookup can return null), so we force all partition fields nullable.
+                ref_schema
+                    .with_fields_filtered_nonempty(|f| tps.field(f.name()).is_some())?
+                    .map(|partition_schema| {
+                        let nullable_fields = partition_schema
+                            .fields()
+                            .map(|f| StructField::nullable(f.name(), f.data_type().clone()));
+                        Arc::new(StructType::new_unchecked(nullable_fields))
+                    })
+            }
+            _ => None,
+        };
 
         // When the engine requested the typed struct, emit all partition columns rather than
         // the predicate-narrowed subset. The data skipping filter only references the columns
@@ -1079,6 +1075,7 @@ pub(crate) mod tests {
             StatsOptions {
                 synthesize_json: true,
                 struct_stats: StructStats::Columns(vec![column_name!("value")]),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1125,6 +1122,7 @@ pub(crate) mod tests {
             StatsOptions {
                 synthesize_json: true,
                 struct_stats: StructStats::Columns(vec![column_name!("value")]),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1281,6 +1279,7 @@ pub(crate) mod tests {
             StatsOptions {
                 synthesize_json: true,
                 struct_stats: StructStats::Columns(vec![column_name!("col_a")]),
+                ..Default::default()
             },
         )
         .unwrap();

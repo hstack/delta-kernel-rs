@@ -25,7 +25,7 @@ use crate::metrics::SnapshotLoadMetricContext;
 use crate::path::LogPathFileType::*;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::compare::SchemaComparison;
-use crate::schema::{lazy_schema_ref, DataType, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{lazy_schema_ref, DataType, SchemaRef, SchemaStructPatchBuilder, StructField, StructType, ToSchema as _};
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
@@ -37,6 +37,7 @@ mod domain_metadata_replay;
 mod protocol_metadata_replay;
 
 pub(crate) use domain_metadata_replay::DomainMetadataMap;
+use crate::scan::log_replay::ScanStatsOptions;
 
 #[cfg(test)]
 mod crc_tests;
@@ -727,6 +728,38 @@ impl LogSegment {
             effective_predicate,
             stats_schema,
             partition_schema,
+            None,
+        )?;
+
+        Ok(ActionsWithCheckpointInfo {
+            actions: commit_stream.chain(checkpoint_result.actions),
+            checkpoint_info: checkpoint_result.checkpoint_info,
+        })
+    }
+
+    pub(crate) fn read_actions_with_projected_checkpoint_actions_for_scan(
+        &self,
+        engine: &dyn Engine,
+        commit_read_schema: SchemaRef,
+        checkpoint_read_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+        stats_schema: Option<&StructType>,
+        partition_schema: Option<&StructType>,
+        stats_options: &ScanStatsOptions,
+    ) -> DeltaResult<
+        ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+    > {
+        // `replay` expects commit files to be sorted in descending order, so the return value here
+        // is correct
+        let commit_stream = CommitReader::try_new(engine, self, commit_read_schema)?;
+
+        let checkpoint_result = self.create_checkpoint_stream(
+            engine,
+            checkpoint_read_schema,
+            meta_predicate,
+            stats_schema,
+            partition_schema,
+            Some(stats_options),
         )?;
 
         Ok(ActionsWithCheckpointInfo {
@@ -900,6 +933,7 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
+        stats_options: Option<&ScanStatsOptions>,
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
@@ -911,13 +945,41 @@ impl LogSegment {
             (None, vec![])
         };
 
-        let has_stats_parsed =
-            stats_schema
-                .zip(file_actions_schema.as_ref())
-                .is_some_and(|(stats, file_schema)| {
-                    Self::schema_has_compatible_stats_parsed(file_schema, stats)
-                });
-
+        let available_stats_schema = file_actions_schema
+            .as_ref()
+            .and_then(|schema| schema.field("add"))
+            .and_then(|field| match field.data_type() {
+                DataType::Struct(add) => add.field("stats_parsed"),
+                _ => None,
+            })
+            .and_then(|field| match field.data_type() {
+                DataType::Struct(stats) => Some(stats.as_ref().clone()),
+                _ => None,
+            });
+        let stats_disabled = stats_options.is_some_and(|options| options.skip_stats);
+        let typed_stats_schema = (!stats_disabled).then(|| stats_schema.cloned()).flatten();
+        let has_stats_parsed = typed_stats_schema
+            .as_ref()
+            .zip(file_actions_schema.as_ref())
+            .is_some_and(|(stats, file_schema)| {
+                Self::schema_has_compatible_stats_parsed(file_schema, stats)
+            });
+        let projected_stats_schema = if has_stats_parsed {
+            typed_stats_schema.clone()
+        } else if stats_options
+            .is_some_and(|options| !options.skip_stats && options.synthesize_json)
+        {
+            available_stats_schema
+        } else {
+            None
+        };
+        let read_raw_stats = stats_options.is_none_or(|options| {
+            !options.skip_stats
+                && (options.synthesize_json
+                    || (options.checkpoint_stats_json_fallback
+                        && typed_stats_schema.is_some()
+                        && !has_stats_parsed))
+        });
         let has_partition_values_parsed = partition_schema
             .zip(file_actions_schema.as_ref())
             .is_some_and(|(ps, fs)| Self::schema_has_compatible_partition_values_parsed(fs, ps));
@@ -926,66 +988,80 @@ impl LogSegment {
         let needs_json_stats_fallback = stats_schema.is_some()
             && !has_stats_parsed
             && action_schema.field("add").is_some_and(|field| {
-                let DataType::Struct(add) = field.data_type() else {
-                    return false;
-                };
-                add.field("stats").is_none()
-            });
-        let needs_sidecar = need_file_actions && !sidecar_files.is_empty();
-        let needs_add_augmentation =
-            needs_json_stats_fallback || has_stats_parsed || has_partition_values_parsed;
-        let augmented_checkpoint_read_schema = if needs_add_augmentation || needs_sidecar {
-            let mut new_fields: Vec<StructField> = if let (true, Some(add_field)) =
-                (needs_add_augmentation, action_schema.field("add"))
-            {
-                let DataType::Struct(add_struct) = add_field.data_type() else {
-                    return Err(Error::internal_error(
-                        "add field in action schema must be a struct",
-                    ));
-                };
-                let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
-
-                if needs_json_stats_fallback {
-                    add_fields.push(StructField::nullable("stats", DataType::STRING));
-                }
-
-                if let (true, Some(ss)) = (has_stats_parsed, stats_schema) {
-                    add_fields.push(StructField::nullable("stats_parsed", ss.clone()));
-                }
-
-                if let (true, Some(ps)) = (has_partition_values_parsed, partition_schema) {
-                    add_fields.push(StructField::nullable("partitionValues_parsed", ps.clone()));
-                }
-
-                // Rebuild schema with modified add field
-                action_schema
-                    .fields()
-                    .map(|f| {
-                        if f.name() == "add" {
-                            StructField::new(
-                                add_field.name(),
-                                StructType::new_unchecked(add_fields.clone()),
-                                add_field.is_nullable(),
-                            )
-                            .with_metadata(add_field.metadata.clone())
-                        } else {
-                            f.clone()
-                        }
-                    })
-                    .collect()
-            } else {
-                action_schema.fields().cloned().collect()
+            let DataType::Struct(add) = field.data_type() else {
+                return false;
             };
+            add.field("stats").is_none()
+        });
+
+        // Build final schema with any additional fields needed
+        // (stats_parsed, partitionValues_parsed, sidecar)
+        let needs_sidecar = need_file_actions
+            && !sidecar_files.is_empty()
+            && !action_schema.contains(SIDECAR_NAME);
+        let needs_add_augmentation = stats_options.is_some()
+            || projected_stats_schema.is_some()
+            || has_partition_values_parsed;
+        let augmented_checkpoint_read_schema = if needs_add_augmentation || needs_sidecar {
+            let mut builder = SchemaStructPatchBuilder::new();
+
+            // Re-project the `add` struct: drop any pre-existing parsed columns (and raw `stats`
+            // when it is not needed) before re-adding the parsed columns we want.
+            if needs_add_augmentation && action_schema.field("add").is_some() {
+                builder = builder
+                    .drop_if_exists_at(["add"], "stats_parsed")
+                    .drop_if_exists_at(["add"], "partitionValues_parsed");
+                if !read_raw_stats {
+                    builder = builder.drop_if_exists_at(["add"], "stats");
+                } else {
+                    let have_to_add_stats_field = action_schema.field("add").is_some_and(|field| {
+                        let DataType::Struct(add) = field.data_type() else {
+                            return false;
+                        };
+                        add.field("stats").is_none()
+                    });
+                    if have_to_add_stats_field {
+                        builder = builder.append_at(["add"], StructField::nullable("stats", DataType::STRING))
+                    }
+                }
+
+                if let Some(stats_schema) = projected_stats_schema.as_ref() {
+                    builder = builder
+                        .append_at(["add"], StructField::nullable("stats_parsed", stats_schema.clone()));
+                }
+                if let (true, Some(partition_schema)) =
+                    (has_partition_values_parsed, partition_schema)
+                {
+                    builder = builder.append_at(
+                        ["add"],
+                        StructField::nullable("partitionValues_parsed", partition_schema.clone()),
+                    );
+                }
+            }
 
             // Add sidecar column at top-level for V2 checkpoints
             if needs_sidecar {
-                new_fields.push(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
+                builder = builder.append(StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
             }
 
-            Arc::new(StructType::new_unchecked(new_fields))
+            Arc::new(builder.build(&action_schema)?)
         } else {
             // No modifications needed, use schema as-is
             action_schema.clone()
+        };
+
+        // Derive action-type row-group pruning from the final physical projection. A stats
+        // predicate cannot be evaluated when typed stats fall back to raw JSON.
+        let is_not_null_pred = schema_to_is_not_null_predicate(&augmented_checkpoint_read_schema);
+        let meta_predicate = (typed_stats_schema.is_none() || has_stats_parsed)
+            .then_some(meta_predicate)
+            .flatten();
+        let effective_predicate = match (is_not_null_pred, meta_predicate) {
+            (None, predicate) | (predicate, None) => predicate,
+            (Some(left), Some(right)) => Some(Arc::new(Predicate::and(
+                (*left).clone(),
+                (*right).clone(),
+            ))),
         };
 
         let checkpoint_file_meta: Vec<_> = self
@@ -1006,14 +1082,14 @@ impl LogSegment {
                 engine.json_handler().read_json_files(
                     &checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
-                    meta_predicate.clone(),
+                    effective_predicate.clone(),
                 )?
             }
             Some(parsed_log_path) if parsed_log_path.extension == "parquet" => parquet_handler
                 .read_parquet_files(
                     &checkpoint_file_meta,
                     augmented_checkpoint_read_schema.clone(),
-                    meta_predicate.clone(),
+                    effective_predicate.clone(),
                 )?,
             Some(parsed_log_path) => {
                 return Err(Error::generic(format!(
@@ -1034,7 +1110,7 @@ impl LogSegment {
             parquet_handler.read_parquet_files(
                 &sidecar_files,
                 augmented_checkpoint_read_schema.clone(),
-                meta_predicate,
+                effective_predicate,
             )?
         } else {
             Box::new(std::iter::empty())

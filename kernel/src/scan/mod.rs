@@ -15,7 +15,7 @@ use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{Add, ADD_FIELD, ADD_NAME, REMOVE_FIELD};
+use crate::actions::{Add, ADD_FIELD, ADD_NAME, NUM_RECORDS, REMOVE_FIELD};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{
@@ -28,19 +28,20 @@ use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
 use crate::scan::log_replay::{
+    get_scan_metadata_transform_expr_with_parsed_columns, scan_row_schema_with_parsed_columns,
     ScanLogReplayProcessor, BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME,
     DEFAULT_ROW_COMMIT_VERSION_NAME,
 };
 use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
-    lazy_schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField,
-    StructType, ToSchema as _,
+    lazy_schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef,
+    SchemaStructPatchBuilder, StructField, StructType, ToSchema as _,
 };
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
 use crate::utils::{FoldWithOption as _, IteratorExt};
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
+use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator, FileMeta, SnapshotRef, Version};
 
 pub(crate) mod data_skipping;
 pub(crate) mod field_classifiers;
@@ -60,6 +61,23 @@ pub(crate) static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     (&ADD_FIELD),
     (&REMOVE_FIELD),
 };
+pub(crate) static COMMIT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
+    let schema = SchemaStructPatchBuilder::new()
+        .drop_at(["add"], "stats")
+        .drop_at(["remove"], "stats")
+        .build(&COMMIT_READ_SCHEMA)
+        .expect("dropping stats from commit read schema");
+    Arc::new(schema)
+});
+
+fn commit_read_schema(skip_stats: bool) -> SchemaRef {
+    if skip_stats {
+        COMMIT_READ_SCHEMA_NO_JSON_STATS.clone()
+    } else {
+        COMMIT_READ_SCHEMA.clone()
+    }
+}
+
 pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
     (&ADD_FIELD),
 };
@@ -98,7 +116,7 @@ pub use crate::parallel::parallel_scan_metadata::{
 /// - [`Self::all`] -- both representations.
 /// - [`Self::none`] -- neither, AND disables internal data skipping. Unlike the other four
 ///   constructors, this is the only one that stops kernel from reading stats from parquet at all.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct StatsOptions {
     /// Whether to surface JSON stats on parsed-stats checkpoints (where the
     /// checkpoint writes stats only as a struct, not as JSON). When true, kernel
@@ -112,10 +130,19 @@ pub struct StatsOptions {
 
     /// Which struct stats columns to emit in `stats_parsed`.
     pub(crate) struct_stats: StructStats,
+
+    /// Whether typed statistics may fall back to checkpoint `add.stats` JSON when a compatible
+    /// `add.stats_parsed` struct is unavailable.
+    #[serde(default = "default_checkpoint_stats_json_fallback")]
+    checkpoint_stats_json_fallback: bool,
+}
+
+fn default_checkpoint_stats_json_fallback() -> bool {
+    true
 }
 
 /// Which struct stats columns appear in `stats_parsed` in scan metadata output.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum StructStats {
     /// Don't emit `stats_parsed`. Kernel still reads predicate-referenced stats for
     /// internal data skipping unless the caller picked [`StatsOptions::none`], which
@@ -133,6 +160,7 @@ impl Default for StatsOptions {
         Self {
             synthesize_json: true,
             struct_stats: StructStats::None,
+            checkpoint_stats_json_fallback: true,
         }
     }
 }
@@ -150,6 +178,7 @@ impl StatsOptions {
         Self {
             synthesize_json: false,
             struct_stats: StructStats::All,
+            checkpoint_stats_json_fallback: true,
         }
     }
 
@@ -159,6 +188,7 @@ impl StatsOptions {
         Self {
             synthesize_json: false,
             struct_stats: StructStats::Columns(cols),
+            checkpoint_stats_json_fallback: true,
         }
     }
 
@@ -167,6 +197,7 @@ impl StatsOptions {
         Self {
             synthesize_json: true,
             struct_stats: StructStats::All,
+            checkpoint_stats_json_fallback: true,
         }
     }
 
@@ -180,7 +211,15 @@ impl StatsOptions {
         Self {
             synthesize_json: false,
             struct_stats: StructStats::None,
+            checkpoint_stats_json_fallback: true,
         }
+    }
+
+    /// Configure whether typed statistics may fall back to raw checkpoint JSON when a compatible
+    /// `stats_parsed` struct is unavailable.
+    pub fn with_checkpoint_stats_json_fallback(mut self, enabled: bool) -> Self {
+        self.checkpoint_stats_json_fallback = enabled;
+        self
     }
 }
 
@@ -594,6 +633,16 @@ pub(crate) fn restored_add_schema() -> &'static SchemaRef {
     &RESTORED_ADD_SCHEMA
 }
 
+fn restored_add_schema_with_parsed_columns(stats_schema: &StructType) -> DeltaResult<SchemaRef> {
+    let schema = SchemaStructPatchBuilder::new()
+        .append_at(
+            ["add"],
+            StructField::nullable(log_replay::STATS_PARSED_NAME, stats_schema.clone()),
+        )
+        .build(&RESTORED_ADD_SCHEMA)?;
+    Ok(Arc::new(schema))
+}
+
 /// utility method making it easy to get a transform for a particular row. If the requested row is
 /// outside the range of the passed slice returns `None`, otherwise returns the element at the index
 /// of the specified row
@@ -625,6 +674,9 @@ pub struct ScanMetadata {
     /// Note: This vector can be indexed by row number, as rows masked by the selection vector will
     /// have corresponding entries that will be `None`.
     pub scan_file_transforms: Vec<Option<ExpressionRef>>,
+
+    /// Whether requested scan output includes a typed `stats_parsed.numRecords` field.
+    has_typed_num_records: bool,
 }
 
 impl ScanMetadata {
@@ -632,10 +684,13 @@ impl ScanMetadata {
         data: Box<dyn EngineData>,
         selection_vector: Vec<bool>,
         scan_file_transforms: Vec<Option<ExpressionRef>>,
+        stats_schema: Option<&SchemaRef>,
     ) -> DeltaResult<Self> {
         Ok(Self {
             scan_files: FilteredEngineData::try_new(data, selection_vector)?,
             scan_file_transforms,
+            has_typed_num_records: stats_schema
+                .is_some_and(|schema| schema.field(NUM_RECORDS).is_some()),
         })
     }
 }
@@ -706,6 +761,7 @@ impl Scan {
         log_replay::ScanStatsOptions {
             skip_stats: self.skip_stats(),
             synthesize_json: self.stats.synthesize_json,
+            checkpoint_stats_json_fallback: self.stats.checkpoint_stats_json_fallback,
         }
     }
 
@@ -756,6 +812,16 @@ impl Scan {
             Some(predicate.clone())
         } else {
             None
+        }
+    }
+
+    /// Get the parsed statistics schema already planned for replay by this scan.
+    #[internal_api]
+    pub(crate) fn effective_replay_stats_schema(&self) -> Option<&SchemaRef> {
+        if self.skip_stats() {
+            None
+        } else {
+            self.state_info.physical_stats_schema.as_ref()
         }
     }
 
@@ -832,6 +898,7 @@ impl Scan {
     /// # Parameters
     ///
     /// * `existing_version` - Table version the provided data was read from.
+    /// * `seeded_stats_parsed_schema` - Schema contract shared by every batch in `existing_data`.
     /// * `existing_data` - Existing processed scan metadata with all selection vectors applied.
     /// * `existing_predicate` - The predicate used by the previous scan.
     #[allow(unused)]
@@ -840,7 +907,8 @@ impl Scan {
         &self,
         engine: &dyn Engine,
         existing_version: Version,
-        existing_data: impl IntoIterator<Item = Box<dyn EngineData>> + 'static,
+        seeded_stats_parsed_schema: Option<SchemaRef>,
+        existing_data: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>> + 'static,
         _existing_predicate: Option<PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
@@ -853,37 +921,37 @@ impl Scan {
             )));
         }
 
-        // in order to be processed by our log replay, we must re-shape the existing scan metadata
-        // back into shape as we read it from the log. Since it is already reconciled data,
-        // we treat it as if it originated from a checkpoint.
-        let transform = engine.evaluation_handler().new_expression_evaluator(
-            scan_row_schema(),
-            get_scan_metadata_transform_expr(),
-            restored_add_schema().clone().into(),
-        )?;
-        let apply_transform = move |data: Box<dyn EngineData>| {
-            Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))
-        };
+        // // in order to be processed by our log replay, we must re-shape the existing scan metadata
+        // // back into shape as we read it from the log. Since it is already reconciled data,
+        // // we treat it as if it originated from a checkpoint.
+        // let transform = engine.evaluation_handler().new_expression_evaluator(
+        //     scan_row_schema(),
+        //     get_scan_metadata_transform_expr(),
+        //     restored_add_schema().clone().into(),
+        // )?;
+        // let apply_transform = move |data: Box<dyn EngineData>| {
+        //     Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))
+        // };
 
         let log_segment = self.snapshot.log_segment();
 
-        // If the snapshot version corresponds to the hint version, we process the existing data
-        // to apply file skipping and provide the required transformations.
-        // Since we're only processing existing data (no checkpoint), we use the base schema
-        // and no stats_parsed optimization.
-        if existing_version == self.snapshot.version() {
-            let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
-                actions: existing_data.into_iter().map(apply_transform),
-                checkpoint_info: CheckpointReadInfo {
-                    has_stats_parsed: false,
-                    has_partition_values_parsed: false,
-                    checkpoint_read_schema: restored_add_schema().clone(),
-                },
-            };
-            return Ok(Box::new(
-                self.scan_metadata_inner(engine, actions_with_checkpoint_info)?,
-            ));
-        }
+        // // If the snapshot version corresponds to the hint version, we process the existing data
+        // // to apply file skipping and provide the required transformations.
+        // // Since we're only processing existing data (no checkpoint), we use the base schema
+        // // and no stats_parsed optimization.
+        // if existing_version == self.snapshot.version() {
+        //     let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
+        //         actions: existing_data.into_iter().map(apply_transform),
+        //         checkpoint_info: CheckpointReadInfo {
+        //             has_stats_parsed: false,
+        //             has_partition_values_parsed: false,
+        //             checkpoint_read_schema: restored_add_schema().clone(),
+        //         },
+        //     };
+        //     return Ok(Box::new(
+        //         self.scan_metadata_inner(engine, actions_with_checkpoint_info)?,
+        //     ));
+        // }
 
         // If the current log segment contains a checkpoint newer than the hint version
         // we disregard the existing data hint, and perform a full scan. The current log segment
@@ -892,6 +960,36 @@ impl Scan {
         // from the log.
         if matches!(log_segment.checkpoint_version, Some(v) if v > existing_version) {
             return Ok(Box::new(self.scan_metadata(engine)?));
+        }
+
+        // Existing scan metadata is already reconciled, so reshape it into checkpoint-style Add
+        // actions with one evaluator built from the declared seed schema. The same evaluator and
+        // checkpoint contract serve same-version and incremental seeded replay.
+        let (transform, checkpoint_info) = seed_replay(
+            engine,
+            &self.state_info,
+            self.stats_options(),
+            seeded_stats_parsed_schema,
+        )?;
+        let seed_actions = existing_data.into_iter().map(move |data| {
+            let data = data?;
+            Ok(ActionsBatch::new(
+                transform.evaluate(data.as_ref())?,
+                false,
+            ))
+        });
+
+        // If the snapshot version corresponds to the hint version, process only the existing data
+        // to apply file skipping and provide the required transformations.
+        if existing_version == self.snapshot.version() {
+            let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
+                actions: seed_actions,
+                checkpoint_info,
+            };
+            return Ok(Box::new(self.scan_metadata_inner(
+                engine,
+                actions_with_checkpoint_info,
+            )?));
         }
 
         // create a new log segment containing only the commits added after the version hint.
@@ -914,19 +1012,20 @@ impl Scan {
         let (checkpoint_schema, meta_predicate, physical_stats_schema) =
             self.checkpoint_read_options();
 
-        let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
+        let result = new_log_segment.read_actions_with_projected_checkpoint_actions_for_scan(
             engine,
-            COMMIT_READ_SCHEMA.clone(),
+            commit_read_schema(self.skip_stats()),
             checkpoint_schema,
             meta_predicate,
             physical_stats_schema,
             None,
+            &self.stats_options(),
         )?;
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
-            actions: result
-                .actions
-                .chain(existing_data.into_iter().map(apply_transform)),
-            checkpoint_info: result.checkpoint_info,
+            // JSON-log batches retain their source transform. Only cached batches pass through the
+            // declared seed transform before both streams enter log replay.
+            actions: result.actions.chain(seed_actions),
+            checkpoint_info,
         };
 
         Ok(Box::new(self.scan_metadata_inner(
@@ -991,9 +1090,9 @@ impl Scan {
 
         self.snapshot
             .log_segment()
-            .read_actions_with_projected_checkpoint_actions(
+            .read_actions_with_projected_checkpoint_actions_for_scan(
                 engine,
-                COMMIT_READ_SCHEMA.clone(),
+                commit_read_schema(self.skip_stats()),
                 checkpoint_schema,
                 meta_predicate,
                 physical_stats_schema,
@@ -1001,6 +1100,7 @@ impl Scan {
                     .physical_partition_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
+                &self.stats_options(),
             )
     }
 
@@ -1253,6 +1353,85 @@ impl Scan {
             .map(|x| x?);
         Ok(result)
     }
+}
+
+/// Reshapes reconciled `ScanMetadata` seed rows into checkpoint-style `add`
+/// actions for replay with newer commits.
+///
+/// Input:
+/// ```text
+/// { path, size, modificationTime, stats, deletionVector,
+///   fileConstantValues: { partitionValues, baseRowId,
+///     defaultRowCommitVersion, tags, clusteringProvider },
+///   stats_parsed? }
+/// ```
+///
+/// Output:
+/// ```text
+/// { add: { path, partitionValues, size, modificationTime, stats, tags,
+///   deletionVector, baseRowId, defaultRowCommitVersion,
+///   clusteringProvider, stats_parsed? } }
+/// ```
+///
+/// Copies `stats` to `add.stats` without changing it. It handles
+/// `stats_parsed` separately and does not serialize it to JSON.
+///
+/// `seeded_stats_parsed_schema` describes the optional typed stats in every
+/// input batch. Delta-rs gets it from `CachedScanRowEvaluator`.
+///
+/// `state_info.physical_stats_schema` describes the typed stats required by the
+/// current output and data-skipping predicate. Typed stats are projected to this
+/// schema. Extra fields are removed, and missing fields become typed nulls.
+///
+/// Without seeded typed stats, downstream replay can parse raw `stats` when
+/// checkpoint fallback is enabled. Disabled fallback produces typed nulls.
+///
+/// Input rows must already have their selection vectors applied. This transform
+/// preserves row order and count. It does not filter, deduplicate, or replay
+/// actions.
+fn seed_replay(
+    engine: &dyn Engine,
+    state_info: &StateInfo,
+    stats_options: log_replay::ScanStatsOptions,
+    seeded_stats_parsed_schema: Option<SchemaRef>,
+) -> DeltaResult<(Arc<dyn ExpressionEvaluator>, CheckpointReadInfo)> {
+    // let available_stats_schema = seeded_input.stats_parsed_schema;
+    let effective_replay_stats_schema = if stats_options.skip_stats {
+        None
+    } else {
+        state_info.physical_stats_schema.clone()
+    };
+    let input_schema = scan_row_schema_with_parsed_columns(seeded_stats_parsed_schema.clone(), None)?;
+
+    let (transform_expr, checkpoint_read_schema, has_stats_parsed) = match (
+        seeded_stats_parsed_schema.as_ref(),
+        effective_replay_stats_schema.as_ref(),
+    ) {
+        (Some(available), Some(effective)) => (
+            get_scan_metadata_transform_expr_with_parsed_columns(available, effective),
+            restored_add_schema_with_parsed_columns(effective)?,
+            true,
+        ),
+        _ => (
+            get_scan_metadata_transform_expr(),
+            restored_add_schema().clone(),
+            false,
+        ),
+    };
+    let transform = engine.evaluation_handler().new_expression_evaluator(
+        input_schema,
+        transform_expr,
+        checkpoint_read_schema.as_ref().clone().into(),
+    )?;
+
+    Ok((
+        transform,
+        CheckpointReadInfo {
+            has_stats_parsed,
+            has_partition_values_parsed: false,
+            checkpoint_read_schema,
+        },
+    ))
 }
 
 /// Get the base schema that scan rows (from [`Scan::scan_metadata`]) will be returned with.

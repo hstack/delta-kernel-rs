@@ -1217,6 +1217,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None,
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1290,6 +1291,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None,
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1355,6 +1357,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None,
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1408,6 +1411,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None,
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1500,6 +1504,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         None, // meta_predicate
         None, // stats_schema
         None, // partition_schema
+        None,
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -3133,6 +3138,11 @@ async fn test_checkpoint_stream_resolves_stats_projection(
         None, // meta_predicate
         Some(&stats_schema),
         None, // partition_schema
+        Some(&ScanStatsOptions {
+            skip_stats: false,
+            synthesize_json: false,
+            checkpoint_stats_json_fallback: true,
+        }),
     )?;
 
     assert_eq!(
@@ -3740,6 +3750,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
         None, // meta_predicate
         None, // stats_schema
         Some(&partition_schema),
+        None,
     )?;
 
     // Verify that checkpoint_info reports partitionValues_parsed as available
@@ -3805,6 +3816,7 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
         None,
         None,
         Some(&partition_schema),
+        None,
     )?;
 
     // Verify it's false

@@ -7,6 +7,8 @@ use bytes::Bytes;
 use rstest::rstest;
 
 use super::*;
+
+mod stats_read_policy;
 use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::arrow::array::{Array, BooleanArray, Int64Array, StringArray, StructArray};
 use crate::arrow::compute::filter_record_batch;
@@ -663,7 +665,13 @@ fn test_scan_metadata_from_same_version() {
         .try_collect()
         .unwrap();
     let new_files: Vec<_> = scan
-        .scan_metadata_from(engine.as_ref(), version, files, None)
+        .scan_metadata_from(
+            engine.as_ref(),
+            version,
+            None,
+            files.into_iter().map(Ok),
+            None,
+        )
         .unwrap()
         .try_collect()
         .unwrap();
@@ -709,7 +717,13 @@ fn test_scan_metadata_from_with_update() {
         .unwrap();
     let scan = snapshot.scan_builder().build().unwrap();
     let new_files: Vec<_> = scan
-        .scan_metadata_from(engine.as_ref(), 0, files, None)
+        .scan_metadata_from(
+            engine.as_ref(),
+            0,
+            None,
+            files.into_iter().map(Ok),
+            None,
+        )
         .unwrap()
         .map_ok(|ScanMetadata { scan_files, .. }| {
             let (underlying_data, selection_vector) = scan_files.into_parts();
@@ -1724,6 +1738,7 @@ fn test_default_stats_options_no_struct_output() {
 #[case::with_json(StatsOptions {
     synthesize_json: true,
     struct_stats: StructStats::Columns(vec![column_name!("id")]),
+    ..Default::default()
 })]
 #[case::struct_columns_ctor(StatsOptions::struct_columns(vec![column_name!("id")]))]
 fn test_scan_metadata_with_specific_stats_columns(#[case] stats: StatsOptions) {
@@ -1778,6 +1793,7 @@ fn test_scan_metadata_with_multiple_stats_columns() {
         .with_stats(StatsOptions {
             synthesize_json: true,
             struct_stats: StructStats::Columns(vec![column_name!("id"), column_name!("name")]),
+            ..Default::default()
         })
         .build()
         .unwrap();
@@ -1850,6 +1866,7 @@ fn test_scan_metadata_with_nonexistent_stats_columns() {
         .with_stats(StatsOptions {
             synthesize_json: true,
             struct_stats: StructStats::Columns(vec![column_name!("nonexistent_column")]),
+            ..Default::default()
         })
         .build()
         .unwrap();

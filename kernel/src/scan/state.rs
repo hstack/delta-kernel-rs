@@ -7,9 +7,10 @@ use roaring::RoaringTreemap;
 use serde::Deserialize;
 use tracing::warn;
 
-use super::log_replay::SCAN_ROW_SCHEMA;
+use super::log_replay::{SCAN_ROW_SCHEMA, STATS_PARSED_NAME};
 use super::ScanMetadata;
 use crate::actions::deletion_vector::{deletion_treemap_to_bools, DeletionVectorDescriptor};
+use crate::actions::NUM_RECORDS;
 use crate::actions::visitors::visit_deletion_vector_at;
 use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData};
 use crate::scan::get_transform_for_row;
@@ -161,6 +162,7 @@ impl ScanMetadata {
             callback,
             transforms: &self.scan_file_transforms,
             context,
+            has_typed_num_records: self.has_typed_num_records,
         };
         visitor.visit_rows_of(&self.scan_files)?;
         Ok(visitor.context)
@@ -171,23 +173,40 @@ struct ScanFileVisitor<'a, T> {
     callback: ScanCallback<T>,
     transforms: &'a [Option<ExpressionRef>],
     context: T,
+    has_typed_num_records: bool,
 }
+
 impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
             LazyLock::new(|| SCAN_ROW_SCHEMA.leaves(None));
-        NAMES_AND_TYPES.as_ref()
+        static WIDENED_NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            let (names, types) = NAMES_AND_TYPES.as_ref();
+            let mut names = names.to_vec();
+            let mut types = types.to_vec();
+            names.push(ColumnName::new([STATS_PARSED_NAME, NUM_RECORDS]));
+            types.push(DataType::LONG);
+            (names, types).into()
+        });
+        if self.has_typed_num_records {
+            WIDENED_NAMES_AND_TYPES.as_ref()
+        } else {
+            NAMES_AND_TYPES.as_ref()
+        }
     }
     fn visit_filtered<'a>(
         &mut self,
         getters: &[&'a dyn GetData<'a>],
         rows: RowIndexIterator<'_>,
     ) -> DeltaResult<()> {
+        let expected_len = self.selected_column_names_and_types().0.len();
+
         require!(
-            getters.len() == 14,
+            getters.len() == expected_len,
             Error::InternalError(format!(
-                "Wrong number of ScanFileVisitor getters: {}",
-                getters.len()
+                "Wrong number of ScanFileVisitor getters: {} (expected {})",
+                getters.len(),
+                expected_len,
             ))
         );
         for row_index in rows {
@@ -195,15 +214,28 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
             if let Some(path) = getters[0].get_opt(row_index, "scanFile.path")? {
                 let size = getters[1].get(row_index, "scanFile.size")?;
                 let modification_time: i64 = getters[2].get(row_index, "add.modificationTime")?;
-                let stats: Option<String> = getters[3].get_opt(row_index, "scanFile.stats")?;
-                let stats: Option<Stats> =
-                    stats.and_then(|json| match serde_json::from_str(json.as_str()) {
+                let stats_json: Option<String> =
+                    getters[3].get_opt(row_index, "scanFile.stats")?;
+                let mut stats: Option<Stats> = stats_json.as_deref().and_then(|json| {
+                    match serde_json::from_str(json) {
                         Ok(stats) => Some(stats),
                         Err(e) => {
                             warn!("Invalid stats string in Add file {json}: {}", e);
                             None
                         }
-                    });
+                    }
+                });
+                if stats_json.is_none() && self.has_typed_num_records {
+                    let num_records: Option<i64> = getters
+                        .last()
+                        .expect("typed numRecords getter must be present")
+                        .get_opt(row_index, "scanFile.stats_parsed.numRecords")?;
+                    if let Some(num_records) = num_records.filter(|value| *value >= 0) {
+                        stats = Some(Stats {
+                            num_records: num_records as u64,
+                        });
+                    }
+                }
 
                 let dv_index = SCAN_ROW_SCHEMA
                     .index_of("deletionVector")
