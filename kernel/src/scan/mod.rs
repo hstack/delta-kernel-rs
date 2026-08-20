@@ -11,6 +11,7 @@ use tracing::{debug, info};
 use url::Url;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
+use self::data_skipping_partition::as_checkpoint_partition_predicate;
 use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -44,6 +45,7 @@ use crate::utils::{FoldWithOption as _, IteratorExt};
 use crate::{DeltaResult, Engine, EngineData, Error, ExpressionEvaluator, FileMeta, SnapshotRef, Version};
 
 pub(crate) mod data_skipping;
+mod data_skipping_partition;
 pub(crate) mod field_classifiers;
 pub mod log_replay;
 pub(crate) mod metrics;
@@ -1011,12 +1013,18 @@ impl Scan {
         // checkpoint schema returned by the function for consistency.
         let (checkpoint_schema, meta_predicate, physical_stats_schema) =
             self.checkpoint_read_options();
+        let scan_predicate = match &self.state_info.physical_predicate {
+            PhysicalPredicate::Some(predicate, _) => Some(predicate.clone()),
+            _ => None,
+        };
 
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions_for_scan(
             engine,
             commit_read_schema(self.skip_stats()),
             checkpoint_schema,
+            scan_predicate,
             meta_predicate,
+            None,
             physical_stats_schema,
             None,
             &self.stats_options(),
@@ -1087,6 +1095,11 @@ impl Scan {
     > {
         let (checkpoint_schema, meta_predicate, physical_stats_schema) =
             self.checkpoint_read_options();
+        let scan_predicate = match &self.state_info.physical_predicate {
+            PhysicalPredicate::Some(predicate, _) => Some(predicate.clone()),
+            _ => None,
+        };
+        let partition_predicate = self.build_actions_partition_predicate();
 
         self.snapshot
             .log_segment()
@@ -1094,7 +1107,9 @@ impl Scan {
                 engine,
                 commit_read_schema(self.skip_stats()),
                 checkpoint_schema,
+                scan_predicate,
                 meta_predicate,
+                partition_predicate,
                 physical_stats_schema,
                 self.state_info
                     .physical_partition_schema
@@ -1141,6 +1156,29 @@ impl Scan {
             prefix: ColumnName::new(["add", "stats_parsed"]),
         };
         let prefixed = prefixer.transform_pred(&skipping_pred);
+        Some(Arc::new(prefixed.into_owned()))
+    }
+
+    /// Builds a predicate for row group skipping from exact partition values in checkpoint and
+    /// sidecar parquet files.
+    fn build_actions_partition_predicate(&self) -> Option<PredicateRef> {
+        let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
+            return None;
+        };
+        let partition_columns: Vec<_> = self
+            .state_info
+            .physical_partition_schema
+            .as_ref()?
+            .fields()
+            .map(|field| field.name().to_string())
+            .collect();
+        let partition_predicate =
+            as_checkpoint_partition_predicate(predicate, &partition_columns)?;
+
+        let mut prefixer = PrefixColumns {
+            prefix: ColumnName::new(["add"]),
+        };
+        let prefixed = prefixer.transform_pred(&partition_predicate);
         Some(Arc::new(prefixed.into_owned()))
     }
 

@@ -1090,6 +1090,15 @@ fn reorder_map(
     Ok(Some((new_field, map)))
 }
 
+/// Rewrites Arrow field wrappers to match a kernel schema without copying array buffers.
+#[internal_api]
+pub(crate) fn apply_kernel_schema(
+    batch: &StructArray,
+    schema: &SchemaRef,
+) -> DeltaResult<StructArray> {
+    apply_schema_to_struct(batch, schema)
+}
+
 /// Use this function to recursively compute properly unioned null masks for all nested
 /// columns of a record batch, making it safe to project out and consume nested columns.
 ///

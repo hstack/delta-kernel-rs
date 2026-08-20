@@ -5,7 +5,7 @@ use itertools::Itertools;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, DeltaResultIteratorStatic, Engine};
+use crate::{DeltaResult, DeltaResultIteratorStatic, Engine, PredicateRef};
 
 /// Phase that processes JSON commit files into [`ActionsBatch`]s
 pub(crate) struct CommitReader {
@@ -19,15 +19,17 @@ impl CommitReader {
     /// - `engine`: Engine for reading files
     /// - `log_segment`: The log segment to process
     /// - `schema`: The schema to read the json files
+    /// - `predicate`: Optional scan predicate forwarded as an engine hint
     pub(crate) fn try_new(
         engine: &dyn Engine,
         log_segment: &LogSegment,
         schema: SchemaRef,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<Self> {
         let commit_files = log_segment.find_commit_cover();
         let actions = engine
             .json_handler()
-            .read_json_files(&commit_files, schema, None)?
+            .read_json_files(&commit_files, schema, predicate)?
             .map_ok(|batch| ActionsBatch::new(batch, true));
 
         Ok(Self {
@@ -62,7 +64,7 @@ mod tests {
         let log_segment = Arc::new(snapshot.log_segment().clone());
 
         let schema = COMMIT_READ_SCHEMA.clone();
-        let commit_phase = CommitReader::try_new(engine.as_ref(), &log_segment, schema)?;
+        let commit_phase = CommitReader::try_new(engine.as_ref(), &log_segment, schema, None)?;
 
         let mut file_paths = vec![];
         for result in commit_phase {

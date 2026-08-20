@@ -720,12 +720,13 @@ impl LogSegment {
 
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
-        let commit_stream = CommitReader::try_new(engine, self, commit_read_schema)?;
+        let commit_stream = CommitReader::try_new(engine, self, commit_read_schema, None)?;
 
         let checkpoint_result = self.create_checkpoint_stream(
             engine,
             checkpoint_read_schema,
             effective_predicate,
+            None,
             stats_schema,
             partition_schema,
             None,
@@ -742,7 +743,9 @@ impl LogSegment {
         engine: &dyn Engine,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
+        scan_predicate: Option<PredicateRef>,
         meta_predicate: Option<PredicateRef>,
+        partition_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
         stats_options: &ScanStatsOptions,
@@ -751,12 +754,18 @@ impl LogSegment {
     > {
         // `replay` expects commit files to be sorted in descending order, so the return value here
         // is correct
-        let commit_stream = CommitReader::try_new(engine, self, commit_read_schema)?;
+        let commit_stream = CommitReader::try_new(
+            engine,
+            self,
+            commit_read_schema,
+            scan_predicate.clone(),
+        )?;
 
         let checkpoint_result = self.create_checkpoint_stream(
             engine,
             checkpoint_read_schema,
             meta_predicate,
+            partition_predicate,
             stats_schema,
             partition_schema,
             Some(stats_options),
@@ -931,6 +940,7 @@ impl LogSegment {
         engine: &dyn Engine,
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
+        partition_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
         stats_options: Option<&ScanStatsOptions>,
@@ -1056,13 +1066,24 @@ impl LogSegment {
         let meta_predicate = (typed_stats_schema.is_none() || has_stats_parsed)
             .then_some(meta_predicate)
             .flatten();
-        let effective_predicate = match (is_not_null_pred, meta_predicate) {
-            (None, predicate) | (predicate, None) => predicate,
-            (Some(left), Some(right)) => Some(Arc::new(Predicate::and(
-                (*left).clone(),
-                (*right).clone(),
-            ))),
+        let partition_predicate = if has_partition_values_parsed {
+            partition_predicate
+        } else {
+            if partition_predicate.is_some() {
+                tracing::log::warn!(
+                    "Checkpoint partition predicate disabled: add.partitionValues_parsed is unavailable or incompatible"
+                );
+            }
+            None
         };
+        let mut predicates = [is_not_null_pred, meta_predicate, partition_predicate]
+            .into_iter()
+            .flatten();
+        let effective_predicate = predicates.next().map(|first| {
+            predicates.fold(first, |left, right| {
+                Arc::new(Predicate::and((*left).clone(), (*right).clone()))
+            })
+        });
 
         let checkpoint_file_meta: Vec<_> = self
             .listed
