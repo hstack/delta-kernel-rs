@@ -851,6 +851,7 @@ impl LogSegment {
             engine,
             checkpoint_read_schema,
             meta_predicate,
+            None,
             stats_schema,
             partition_schema,
             None,
@@ -875,7 +876,9 @@ impl LogSegment {
         engine: &dyn Engine,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
+        scan_predicate: Option<PredicateRef>,
         meta_predicate: Option<PredicateRef>,
+        partition_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
         stats_options: &ScanStatsOptions,
@@ -883,12 +886,17 @@ impl LogSegment {
     ) -> KernelResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = KernelResult<ActionsBatch>> + Send>,
     > {
-        let commit_stream =
-            self.read_commit_actions(engine, commit_read_schema, cancellation_token)?;
+        let commit_stream = self.read_commit_actions_with_predicate(
+            engine,
+            commit_read_schema,
+            scan_predicate,
+            cancellation_token,
+        )?;
         let checkpoint_result = self.create_checkpoint_stream(
             engine,
             checkpoint_read_schema,
             meta_predicate,
+            partition_predicate,
             stats_schema,
             partition_schema,
             Some(stats_options),
@@ -963,13 +971,23 @@ impl LogSegment {
         schema: SchemaRef,
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> KernelResult<impl Iterator<Item = KernelResult<ActionsBatch>> + Send> {
+        self.read_commit_actions_with_predicate(engine, schema, None, cancellation_token)
+    }
+
+    fn read_commit_actions_with_predicate(
+        &self,
+        engine: &dyn Engine,
+        schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<&CancellationTokenRef>,
+    ) -> KernelResult<impl Iterator<Item = KernelResult<ActionsBatch>> + Send> {
         let commit_files = self.find_commit_cover();
         let actions = engine
             .json_handler()
             .read_json_files_with_cancellation(
                 &commit_files,
                 schema,
-                None,
+                predicate,
                 cancellation_token.cloned(),
             )?
             .map_ok(|batch| ActionsBatch::new(batch, true));
@@ -1225,6 +1243,7 @@ impl LogSegment {
         engine: &dyn Engine,
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
+        partition_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
         partition_schema: Option<&StructType>,
         stats_options: Option<&ScanStatsOptions>,
@@ -1336,6 +1355,17 @@ impl LogSegment {
             action_schema.clone()
         };
 
+        let partition_predicate = if has_partition_values_parsed {
+            partition_predicate
+        } else {
+            if partition_predicate.is_some() {
+                warn!(
+                    "Checkpoint partition predicate disabled: \
+                     add.partitionValues_parsed is unavailable or incompatible"
+                );
+            }
+            None
+        };
         let effective_predicate = if stats_options.is_some() {
             // Sidecar references are already cached. Keep pruning scoped to requested actions,
             // not the sidecar column added to the physical read schema.
@@ -1343,9 +1373,12 @@ impl LogSegment {
             let meta_predicate = (typed_stats_schema.is_none() || has_stats_parsed)
                 .then_some(meta_predicate)
                 .flatten();
-            combine_checkpoint_predicates(projection_predicate, meta_predicate)
+            combine_checkpoint_predicates(
+                combine_checkpoint_predicates(projection_predicate, meta_predicate),
+                partition_predicate,
+            )
         } else {
-            meta_predicate
+            combine_checkpoint_predicates(meta_predicate, partition_predicate)
         };
 
         let checkpoint_file_meta: Vec<_> = self

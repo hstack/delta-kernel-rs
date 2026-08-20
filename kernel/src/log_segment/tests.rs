@@ -1,4 +1,4 @@
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use itertools::Itertools;
 use rstest::rstest;
@@ -20,7 +20,7 @@ use crate::engine::arrow_expression::evaluate_expression::extract_column_ref;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::engine::sync::SyncEngine;
 use crate::engine::test_delegating::DelegatingEngine;
-use crate::expressions::{col, column_name};
+use crate::expressions::{col, column_name, lit};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::last_checkpoint_hint::{AmtCheckpoint, CheckpointType};
 use crate::last_checkpoint_hint::{HintAction, LastCheckpointHint, LastCheckpointV2};
@@ -56,10 +56,88 @@ use crate::unit_test_utils::{geography_type, geometry_type};
 #[cfg(feature = "adaptive-metadata-in-dev")]
 use crate::Snapshot;
 use crate::{
-    EngineData, FileDataReadResultIterator, FileMeta, FileSize, JsonHandler, KernelResult,
-    KernelResultIteratorStatic, ParquetFooter, ParquetHandler, Predicate, PredicateRef, RowVisitor,
-    StorageHandler,
+    Engine, EngineData, EvaluationHandler, FileDataReadResultIterator, FileMeta, FileSize,
+    JsonHandler, KernelResult, KernelResultIteratorStatic, ParquetFooter, ParquetHandler,
+    Predicate, PredicateRef, RowVisitor, StorageHandler,
 };
+
+#[derive(Debug)]
+struct RecordedPredicateRead {
+    physical_schema: SchemaRef,
+    predicate: Option<PredicateRef>,
+}
+
+struct PredicateRecordingParquetHandler {
+    inner: Arc<dyn ParquetHandler>,
+    reads: Mutex<Vec<RecordedPredicateRead>>,
+}
+
+impl ParquetHandler for PredicateRecordingParquetHandler {
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> KernelResult<FileDataReadResultIterator> {
+        self.reads.lock().unwrap().push(RecordedPredicateRead {
+            physical_schema: physical_schema.clone(),
+            predicate: predicate.clone(),
+        });
+        self.inner
+            .read_parquet_files(files, physical_schema, predicate)
+    }
+
+    fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {
+        self.inner.read_parquet_footer(file)
+    }
+
+    fn write_parquet_file(
+        &self,
+        location: Url,
+        data: KernelResultIteratorStatic<Box<dyn EngineData>>,
+    ) -> KernelResult<FileSize> {
+        self.inner.write_parquet_file(location, data)
+    }
+}
+
+struct PredicateRecordingEngine {
+    inner: Arc<SyncEngine>,
+    parquet: Arc<PredicateRecordingParquetHandler>,
+}
+
+impl PredicateRecordingEngine {
+    fn new(inner: Arc<SyncEngine>) -> Self {
+        Self {
+            parquet: Arc::new(PredicateRecordingParquetHandler {
+                inner: inner.parquet_handler(),
+                reads: Mutex::new(Vec::new()),
+            }),
+            inner,
+        }
+    }
+
+    fn take_reads(&self) -> Vec<RecordedPredicateRead> {
+        std::mem::take(&mut *self.parquet.reads.lock().unwrap())
+    }
+}
+
+impl Engine for PredicateRecordingEngine {
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+        self.inner.evaluation_handler()
+    }
+
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
+        self.inner.json_handler()
+    }
+
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+        self.parquet.clone()
+    }
+
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        self.inner.storage_handler()
+    }
+}
 
 /// Processes sidecar files for the given checkpoint batch.
 ///
@@ -1315,6 +1393,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         &engine,
         v2_checkpoint_read_schema.clone(),
         None, // meta_predicate
+        None, // partition_predicate
         None, // stats_schema
         None, // partition_schema
         None, // stats_options
@@ -1390,6 +1469,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         &engine,
         v2_checkpoint_read_schema.clone(),
         None, // meta_predicate
+        None, // partition_predicate
         None, // stats_schema
         None, // partition_schema
         None, // stats_options
@@ -1457,6 +1537,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         &engine,
         v2_checkpoint_read_schema.clone(),
         None, // meta_predicate
+        None, // partition_predicate
         None, // stats_schema
         None, // partition_schema
         None, // stats_options
@@ -1721,6 +1802,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         &engine,
         v2_checkpoint_read_schema,
         None, // meta_predicate
+        None, // partition_predicate
         None, // stats_schema
         None, // partition_schema
         None, // stats_options
@@ -1815,6 +1897,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         &engine,
         v2_checkpoint_read_schema.clone(),
         None, // meta_predicate
+        None, // partition_predicate
         None, // stats_schema
         None, // partition_schema
         None, // stats_options
@@ -3851,6 +3934,7 @@ async fn test_checkpoint_stream_resolves_stats_projection(
         &engine,
         CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone(),
         None, // meta_predicate
+        None, // partition_predicate
         Some(&stats_schema),
         None, // partition_schema
         Some(&ScanStatsOptions {
@@ -4567,6 +4651,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> KernelResu
         &engine,
         read_schema,
         None, // meta_predicate
+        None, // partition_predicate
         None, // stats_schema
         Some(&partition_schema),
         None, // stats_options
@@ -4598,7 +4683,7 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> KernelResu
 #[tokio::test]
 async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -> KernelResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = SyncEngine::new_with_store(store.clone());
+    let engine = PredicateRecordingEngine::new(Arc::new(SyncEngine::new_with_store(store.clone())));
 
     // Write a checkpoint WITHOUT partitionValues_parsed
     add_checkpoint_to_store(
@@ -4629,10 +4714,15 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
 
     // Pass a partition schema — but the checkpoint doesn't have partitionValues_parsed
     let partition_schema = schema! { nullable "id": INTEGER };
+    let partition_predicate = Arc::new(Predicate::eq(
+        col!("add.partitionValues_parsed.id"),
+        lit(1i32),
+    ));
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         read_schema.clone(),
         None,
+        Some(partition_predicate),
         None,
         Some(&partition_schema),
         None, // stats_options
@@ -4658,6 +4748,25 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
             "checkpoint read schema should NOT include add.partitionValues_parsed"
         );
     }
+
+    for action in checkpoint_result.actions {
+        action?;
+    }
+    let action_reads: Vec<_> = engine
+        .take_reads()
+        .into_iter()
+        .filter(|read| read.physical_schema.field("add").is_some())
+        .collect();
+    assert!(!action_reads.is_empty());
+    assert!(action_reads.iter().all(|read| {
+        read.predicate.as_ref().is_none_or(|predicate| {
+            !predicate.references().contains(&ColumnName::new([
+                "add",
+                "partitionValues_parsed",
+                "id",
+            ]))
+        })
+    }));
 
     Ok(())
 }
