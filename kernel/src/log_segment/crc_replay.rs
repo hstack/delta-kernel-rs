@@ -172,6 +172,7 @@ impl LogSegment {
                 None,
                 None,
                 None,
+                None,
             )?
             .actions;
         for batch in batches {

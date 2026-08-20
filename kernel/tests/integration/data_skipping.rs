@@ -1215,6 +1215,7 @@ fn commit_with_ts_partitioned_adds(version: u64, adds: &[(&str, &str)]) -> Strin
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partition_pruning_honors_rfc3339_offset_partition_values(
     #[values(false, true)] use_parallel: bool,
+    #[values(false, true)] checkpoint: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_tmp_dir, table_path, engine) = test_table_setup_mt()?;
     let schema = schema_ref! {
@@ -1246,6 +1247,12 @@ async fn partition_pruning_honors_rfc3339_offset_partition_values(
         ),
     )
     .await?;
+
+    if checkpoint {
+        Snapshot::builder_for(table_url)
+            .build(engine.as_ref())?
+            .checkpoint(engine.as_ref(), None)?;
+    }
 
     let nine_thirty_utc_us: i64 = 1_718_443_800_000_000; // 2024-06-15T09:30:00Z
     let fourteen_thirty_utc_us: i64 = 1_718_461_800_000_000; // 2024-06-15T14:30:00Z

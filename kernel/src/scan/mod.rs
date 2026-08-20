@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use self::data_skipping::as_checkpoint_skipping_predicate;
+use self::data_skipping_partition::as_checkpoint_partition_predicate;
 use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -53,6 +54,7 @@ use crate::{
 };
 
 pub(crate) mod data_skipping;
+mod data_skipping_partition;
 pub(crate) mod field_classifiers;
 pub mod log_replay;
 pub(crate) mod metrics;
@@ -1222,7 +1224,9 @@ impl Scan {
             engine,
             commit_read_schema(self.skip_stats()),
             checkpoint_schema,
+            self.physical_predicate(),
             meta_predicate,
+            None,
             physical_stats_read_schema,
             None,
             &self.stats_options(),
@@ -1335,13 +1339,16 @@ impl Scan {
             self.checkpoint_read_options();
         // Checkpoints already represent reconciled state, so scans project only Add actions. This
         // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
+        let partition_predicate = self.build_actions_partition_predicate();
         self.snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions_for_scan(
                 engine,
                 commit_read_schema(self.skip_stats()),
                 checkpoint_schema,
+                self.physical_predicate(),
                 meta_predicate,
+                partition_predicate,
                 physical_stats_read_schema,
                 self.state_info
                     .physical_partition_schema
@@ -1404,6 +1411,32 @@ impl Scan {
             prefix: column_name!("add"),
         };
         let prefixed = prefixer.transform_pred(&skipping_pred);
+        Some(Arc::new(prefixed.into_owned()))
+    }
+
+    /// Builds a predicate for row group skipping from exact partition values in checkpoint and
+    /// sidecar parquet files.
+    fn build_actions_partition_predicate(&self) -> Option<PredicateRef> {
+        let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
+            return None;
+        };
+        let partition_columns: Vec<_> = self
+            .state_info
+            .physical_partition_schema
+            .as_ref()?
+            .fields()
+            // Parquet min/max can omit NaNs and cannot bound floating partition values.
+            .filter(|field| {
+                field.data_type() != &DataType::FLOAT && field.data_type() != &DataType::DOUBLE
+            })
+            .map(|field| field.name().to_string())
+            .collect();
+        let partition_predicate = as_checkpoint_partition_predicate(predicate, &partition_columns)?;
+
+        let mut prefixer = PrefixColumns {
+            prefix: ColumnName::new(["add"]),
+        };
+        let prefixed = prefixer.transform_pred(&partition_predicate);
         Some(Arc::new(prefixed.into_owned()))
     }
 
