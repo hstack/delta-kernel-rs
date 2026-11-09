@@ -4,6 +4,8 @@
 
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
+
 use crate::crc::Crc;
 use crate::utils::require;
 use crate::{KernelError, KernelResult, Version};
@@ -15,8 +17,9 @@ use crate::{KernelError, KernelResult, Version};
 /// - stale (older): kept only as a base for [`Self::base`], never served as authoritative.
 ///
 /// [`Snapshot`]: super::Snapshot
-#[derive(Debug)]
-pub(super) struct SnapshotCrc {
+#[derive(Debug, Clone)]
+#[internal_api]
+pub(crate) struct SnapshotCrc {
     crc: Option<Arc<Crc>>,
     snapshot_version: Version,
 }
@@ -24,6 +27,7 @@ pub(super) struct SnapshotCrc {
 impl SnapshotCrc {
     /// Wrap the CRC a snapshot at `snapshot_version` resolved. A `Some(crc)` must sit in
     /// `[checkpoint_version, snapshot_version]`.
+    #[internal_api]
     pub(super) fn try_new(
         crc: Option<Arc<Crc>>,
         snapshot_version: Version,
@@ -53,6 +57,7 @@ impl SnapshotCrc {
 
     /// The CRC iff it sits exactly at the snapshot version, so its cached values are authoritative
     /// at zero I/O. Returns `None` for a stale CRC.
+    #[internal_api]
     pub(super) fn at_version(&self) -> Option<&Arc<Crc>> {
         self.crc
             .as_ref()
@@ -61,6 +66,7 @@ impl SnapshotCrc {
 
     /// The held CRC, at-version or stale, for callers that reuse it regardless of version
     /// (e.g. checksum writes).
+    #[internal_api]
     pub(super) fn base(&self) -> Option<&Arc<Crc>> {
         self.crc.as_ref()
     }

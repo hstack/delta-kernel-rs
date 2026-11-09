@@ -286,7 +286,7 @@ impl LogSegment {
 /// How the latest AMT `checkpoint` action was resolved during P&M replay, stored on the
 /// [`Snapshot`](crate::Snapshot) so consumers can read it without re-scanning the log.
 #[cfg(feature = "adaptive-metadata-in-dev")]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum CheckpointActionResolution {
     /// The latest `checkpoint` action, captured during replay.
     Captured(Arc<CheckpointAction>),

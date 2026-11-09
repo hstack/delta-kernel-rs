@@ -297,23 +297,24 @@ fn validate_partition_columns(
 /// required operations for the table's protocol features.
 #[internal_api]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(unreachable_pub)] // Fields are exposed with the struct by internal-api.
 pub(crate) struct TableConfiguration {
-    metadata: Metadata,
-    protocol: Protocol,
+    pub metadata: Metadata,
+    pub protocol: Protocol,
     /// Logical schema: field names are the user-facing (logical) column names.
-    logical_schema: SchemaRef,
+    pub logical_schema: SchemaRef,
     /// Whether any field in the logical schema declares a column default.
     has_column_with_default: bool,
     /// The subset of the logical schema that remains after excluding partition columns.
-    logical_schema_without_partition_columns: SchemaRef,
+    pub logical_schema_without_partition_columns: SchemaRef,
     /// Physical schema for all columns (field names respect column mapping mode).
-    physical_schema: SchemaRef,
+    pub physical_schema: SchemaRef,
     /// The subset of the physical schema that remains after excluding partition columns.
-    physical_data_schema_without_partition_columns: SchemaRef,
-    table_properties: TableProperties,
-    column_mapping_mode: ColumnMappingMode,
-    table_root: Url,
-    version: Version,
+    pub physical_data_schema_without_partition_columns: SchemaRef,
+    pub table_properties: TableProperties,
+    pub column_mapping_mode: ColumnMappingMode,
+    pub table_root: Url,
+    pub version: Version,
 }
 
 impl TableConfiguration {
@@ -363,7 +364,8 @@ impl TableConfiguration {
         )
     }
 
-    fn try_new_inner(
+    #[internal_api]
+    pub(crate) fn try_new_inner(
         metadata: Metadata,
         protocol: Protocol,
         table_root: Url,
@@ -2722,6 +2724,76 @@ mod test {
             (part_a),
             (part_b),
         }
+    }
+
+    #[rstest]
+    #[case::none(ColumnMappingMode::None, ["part_b", "data_col", "part_a"])]
+    #[case::name(ColumnMappingMode::Name, ["phys_part_b", "phys_data", "phys_part_a"])]
+    #[case::id(ColumnMappingMode::Id, ["phys_part_b", "phys_data", "phys_part_a"])]
+    fn kernel_table_configuration_rebuilds_reordered_schemas(
+        #[case] mode: ColumnMappingMode,
+        #[case] physical_names: [&str; 3],
+    ) {
+        let schema = partitioned_schema_with_column_mapping();
+        let input = MockTableConfigurationBuilder::new()
+            .with_schema(schema.clone())
+            .with_column_mapping(mode)
+            .with_partition_columns(["part_a", "part_b"])
+            .with_protocol(MockProtocolBuilder::new().with_versions(2, 5).build())
+            .with_version(7)
+            .build();
+        let reordered = schema_ref! {
+            (schema.field("part_b").unwrap().clone()),
+            (schema.field("data_col").unwrap().clone()),
+            (schema.field("part_a").unwrap().clone()),
+        };
+
+        let output = crate::hacks::new_kernel_table_configuration(&input, &reordered).unwrap();
+
+        assert_eq!(output.logical_schema(), reordered);
+        assert_eq!(
+            output
+                .physical_schema()
+                .fields()
+                .map(StructField::name)
+                .collect::<Vec<_>>(),
+            physical_names,
+        );
+        assert_eq!(
+            output
+                .physical_data_schema_without_partition_columns()
+                .fields()
+                .map(StructField::name)
+                .collect::<Vec<_>>(),
+            [physical_names[1]],
+        );
+        assert_eq!(
+            output
+                .logical_schema_without_partition_columns()
+                .fields()
+                .map(StructField::name)
+                .collect::<Vec<_>>(),
+            ["data_col"],
+        );
+        assert_eq!(output.metadata(), input.metadata());
+        assert_eq!(output.protocol(), input.protocol());
+        assert_eq!(output.version(), 7);
+        assert_eq!(input.logical_schema(), schema);
+    }
+
+    #[test]
+    fn kernel_table_configuration_rejects_missing_partition_column() {
+        let input = MockTableConfigurationBuilder::new()
+            .with_schema(schema_ref! { nullable "part": STRING })
+            .with_partition_columns(["part"])
+            .build();
+
+        let result = crate::hacks::new_kernel_table_configuration(
+            &input,
+            &schema_ref! { nullable "other": STRING },
+        );
+
+        assert_result_error_with_message(result, "part");
     }
 
     #[test]

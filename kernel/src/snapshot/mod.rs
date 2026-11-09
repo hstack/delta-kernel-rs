@@ -58,7 +58,8 @@ pub use builder::{IncrementalReplay, IncrementalSnapshotBuilder, SnapshotBuilder
 #[allow(unused_imports)]
 #[internal_api]
 pub(crate) use hint::{PublicationWatermark, SnapshotHint, SnapshotHintFreshness};
-use snapshot_crc::SnapshotCrc;
+#[internal_api]
+pub(crate) use snapshot_crc::SnapshotCrc;
 
 pub use crate::error::SnapshotHintError;
 
@@ -90,12 +91,24 @@ pub enum CheckpointWriteResult {
 /// have a defined schema (which may change over time for any given table), specific version, and
 /// frozen log segment.
 pub struct Snapshot {
-    span: tracing::Span,
+    /// Tracing span associated with this snapshot.
+    pub span: tracing::Span,
+    /// Frozen log segment represented by this snapshot.
+    #[cfg(feature = "internal-api")]
+    pub log_segment: LogSegment,
+    #[cfg(not(feature = "internal-api"))]
     log_segment: LogSegment,
+    /// Table configuration, including its logical and physical schemas.
+    #[cfg(feature = "internal-api")]
+    pub table_configuration: TableConfiguration,
+    #[cfg(not(feature = "internal-api"))]
     table_configuration: TableConfiguration,
     /// The newest CRC resolved at construction, kept so later queries and CRC writes reuse it
-    /// instead of re-reading from disk. Queried via [`Snapshot::crc_at_version`] (authoritative,
-    /// zero-I/O) or [`Snapshot::base_crc`] (possibly stale). See [`SnapshotCrc`].
+    /// instead of re-reading from disk. Queried via [`SnapshotCrc::at_version`] (authoritative,
+    /// zero-I/O) or [`SnapshotCrc::base`] (possibly stale).
+    #[cfg(feature = "internal-api")]
+    pub crc: SnapshotCrc,
+    #[cfg(not(feature = "internal-api"))]
     crc: SnapshotCrc,
     /// Best-effort "confirmed latest at build time" flag. See [`Snapshot::built_as_latest`].
     built_as_latest: bool,
@@ -202,6 +215,22 @@ impl Snapshot {
             false, /* built_as_latest */
             false, /* skipped_new_checkpoints */
         )
+    }
+
+    #[cfg(feature = "internal-api")]
+    pub(crate) fn with_table_configuration(&self, table_configuration: TableConfiguration) -> Self {
+        Self {
+            span: self.span.clone(),
+            log_segment: self.log_segment.clone(),
+            table_configuration,
+            crc: self.crc.clone(),
+            built_as_latest: self.built_as_latest,
+            skipped_new_checkpoints: self.skipped_new_checkpoints,
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_action_resolution: self.checkpoint_action_resolution.clone(),
+            #[cfg(feature = "adaptive-metadata-in-dev")]
+            checkpoint_action: self.checkpoint_action.clone(),
+        }
     }
 
     /// Internal constructor that accepts an explicit pre-resolved CRC.
@@ -1641,7 +1670,9 @@ mod tests {
     };
     use crate::table_properties::ENABLE_IN_COMMIT_TIMESTAMPS;
     use crate::transaction::create_table::create_table;
-    use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+    use crate::unit_test_utils::{
+        assert_result_error_with_message, string_array_to_engine_data,
+    };
     use crate::utils::FoldWithOption as _;
 
     /// Helper function to create a commitInfo action with optional ICT
