@@ -598,6 +598,8 @@ impl StateInfo {
         let physical_stats_output_schema =
             super::build_stats_output_schemas(table_configuration, stats)?
                 .map(|schemas| schemas.physical);
+        let physical_stats_read_schema =
+            physical_stats_read_schema.or_else(|| physical_stats_output_schema.clone());
         let physical_stats_schemas = ResolvedPhysicalStatsSchemas::try_new(
             physical_stats_read_schema,
             physical_stats_output_schema,

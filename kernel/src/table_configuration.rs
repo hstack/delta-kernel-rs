@@ -16,7 +16,7 @@ use delta_kernel_derive::internal_api;
 use tracing::warn;
 use url::Url;
 
-use crate::actions::{Metadata, Protocol, NULL_COUNT};
+use crate::actions::{Metadata, Protocol, NULL_COUNT, NUM_RECORDS, TIGHT_BOUNDS};
 use crate::expressions::ColumnName;
 use crate::scan::data_skipping::stats_schema::{
     expected_stats_schema, stats_column_names, StatsConfig, StripFieldMetadataTransform,
@@ -24,7 +24,8 @@ use crate::scan::data_skipping::stats_schema::{
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
 use crate::schema::{
-    schema_has_invariants, validate_column_defaults_metadata, SchemaRef, StructField, StructType,
+    schema_has_invariants, validate_column_defaults_metadata, DataType, SchemaRef, StructField,
+    StructType,
 };
 #[cfg(feature = "geo-type-in-dev")]
 use crate::table_features::validate_geospatial_feature_support;
@@ -602,7 +603,11 @@ impl TableConfiguration {
         #[cfg(feature = "geo-type-in-dev")] geometry_min_max: bool,
     ) -> KernelResult<Option<StatsOutputSchemas>> {
         if logical_columns.is_empty() {
-            return Ok(None);
+            let schema = Arc::new(StructType::new_unchecked([
+                StructField::nullable(NUM_RECORDS, DataType::LONG),
+                StructField::nullable(TIGHT_BOUNDS, DataType::BOOLEAN),
+            ]));
+            return Ok(Some(StatsOutputSchemas::try_new(schema.clone(), schema)?));
         }
 
         let logical_schema = self.logical_schema();
